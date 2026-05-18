@@ -501,7 +501,12 @@ def read_google_sheet(sheet_id: str) -> list[list[str]]:
         f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
         f"/values/Sheet1!A:K?key={GOOGLE_API_KEY}"
     )
+    masked_key = (GOOGLE_API_KEY[:10] + "…") if GOOGLE_API_KEY else "НЕ ЗАДАН"
+    logger.info("Sheets request URL (key masked): %s",
+                url.replace(GOOGLE_API_KEY or "", masked_key))
     r = requests.get(url, timeout=15)
+    if not r.ok:
+        logger.error("Sheets API error %s: %s", r.status_code, r.text[:300])
     r.raise_for_status()
     return r.json().get("values", [])
 
@@ -1221,6 +1226,11 @@ def main() -> None:
     import asyncio
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
+    # Diagnostic: verify env vars are loaded correctly
+    gkey_preview = (GOOGLE_API_KEY[:10] + "…") if GOOGLE_API_KEY else "НЕ ЗАДАН"
+    logger.info("GOOGLE_API_KEY (первые 10 симв.): %s", gkey_preview)
+    logger.info("SHEET_ID: %s", SHEET_ID or "НЕ ЗАДАН")
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
