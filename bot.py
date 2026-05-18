@@ -3,6 +3,7 @@ import sys
 import json
 import base64
 import logging
+import urllib.parse
 import datetime
 import requests
 from pathlib import Path
@@ -495,15 +496,16 @@ def step0_find_subs_from_keywords(keywords: list[str]) -> list[str]:
 
 # ─── Google Sheets ────────────────────────────────────────────────────────────
 
+_SHEET_RANGE = urllib.parse.quote("'Reddit Stats — OF Analytics'!A:K")
+
 def read_google_sheet(sheet_id: str) -> list[list[str]]:
-    """Read all rows from Sheet1 via Google Sheets API v4."""
+    """Read all rows from the analytics sheet via Google Sheets API v4."""
     url = (
         f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
-        f"/values/Sheet1!A:K?key={GOOGLE_API_KEY}"
+        f"/values/{_SHEET_RANGE}?key={GOOGLE_API_KEY}"
     )
     masked_key = (GOOGLE_API_KEY[:10] + "…") if GOOGLE_API_KEY else "НЕ ЗАДАН"
-    logger.info("Sheets request URL (key masked): %s",
-                url.replace(GOOGLE_API_KEY or "", masked_key))
+    logger.info("Sheets request URL: %s", url.replace(GOOGLE_API_KEY or "", masked_key))
     r = requests.get(url, timeout=15)
     if not r.ok:
         logger.error("Sheets API error %s: %s", r.status_code, r.text[:300])
