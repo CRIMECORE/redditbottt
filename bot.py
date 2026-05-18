@@ -47,11 +47,11 @@ OPENROUTER_API_KEY      = os.getenv("OPENROUTER_API_KEY")
 SUPABASE_URL            = os.getenv("SUPABASE_URL")
 SUPABASE_KEY            = os.getenv("SUPABASE_KEY")
 SHEET_ID                = os.getenv("SHEET_ID")
-GOOGLE_CREDS_FILE       = os.getenv("GOOGLE_CREDS_FILE", "google_creds.json")
+GOOGLE_API_KEY          = os.getenv("GOOGLE_API_KEY")
 
 _REQUIRED_ENV = [
     "TELEGRAM_TOKEN", "SCRAPECREATORS_API_KEY", "OPENROUTER_API_KEY",
-    "SUPABASE_URL", "SUPABASE_KEY", "SHEET_ID",
+    "SUPABASE_URL", "SUPABASE_KEY", "SHEET_ID", "GOOGLE_API_KEY",
 ]
 _missing = [k for k in _REQUIRED_ENV if not os.getenv(k)]
 if _missing:
@@ -496,38 +496,14 @@ def step0_find_subs_from_keywords(keywords: list[str]) -> list[str]:
 # ─── Google Sheets ────────────────────────────────────────────────────────────
 
 def read_google_sheet(sheet_id: str) -> list[list[str]]:
-    """
-    Read all rows from the first sheet.
-    Priority:
-      1. gspread + service account (if google_creds.json exists)
-      2. CSV export (if sheet is shared 'anyone with link')
-    """
-    creds_path = Path(GOOGLE_CREDS_FILE)
-
-    # Method 1: service account via gspread
-    if _HAS_GSPREAD and creds_path.exists():
-        scopes = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = _GCredentials.from_service_account_file(str(creds_path), scopes=scopes)
-        gc = gspread.authorize(creds)
-        ws = gc.open_by_key(sheet_id).sheet1
-        return ws.get_all_values()
-
-    # Method 2: CSV export (public sheet)
-    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid=0"
-    r = requests.get(url, timeout=15)
-    if r.status_code == 200 and "<html" not in r.text[:50].lower():
-        return list(csv.reader(io.StringIO(r.text)))
-
-    raise RuntimeError(
-        "Не удалось прочитать таблицу.\n"
-        "Вариант A (быстро): Откройте Google Sheets → Файл → Настройки доступа → "
-        "'Все, у кого есть ссылка' → Читатель.\n"
-        "Вариант B (приватно): Положите файл google_creds.json (сервисный аккаунт Google) "
-        "в папку бота и выдайте сервисному аккаунту доступ к таблице."
+    """Read all rows from Sheet1 via Google Sheets API v4."""
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
+        f"/values/Sheet1!A:K?key={GOOGLE_API_KEY}"
     )
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    return r.json().get("values", [])
 
 
 def format_sheet_for_claude(rows: list[list[str]], max_rows: int = 60) -> str:
