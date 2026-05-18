@@ -1,0 +1,31 @@
+# Sensitive credentials & keys
+google_creds.json
+.env
+*.env
+secrets.py
+config_local.py
+
+# Runtime data
+chat_ids.json
+
+# Logs
+bot_out.txt
+bot_err.txt
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp

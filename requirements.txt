@@ -1,0 +1,9 @@
+requests
+python-dotenv
+APScheduler
+pytz
+supabase
+gspread
+google-auth
+python-telegram-bot
+duckduckgo-search

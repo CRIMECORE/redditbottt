@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(pip install *)",
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\('C:/Users/CRIMECORE/RedditBot/bot.py'\\).read\\(\\)\\); print\\('Синтаксис OK'\\)\")",
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\('C:/Users/CRIMECORE/RedditBot/bot.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "PowerShell(cd \"C:\\\\Users\\\\CRIMECORE\\\\RedditBot\"; $env:PYTHONIOENCODING=\"utf-8\"; Start-Process python -ArgumentList \"bot.py\" -PassThru -WindowStyle Normal)",
+      "PowerShell(Get-Process *)",
+      "PowerShell(cd \"C:\\\\Users\\\\CRIMECORE\\\\RedditBot\"; $env:PYTHONIOENCODING=\"utf-8\"; python bot.py 2>&1 | Out-String)",
+      "PowerShell(Stop-Process *)",
+      "PowerShell(cd \"C:\\\\Users\\\\CRIMECORE\\\\RedditBot\"; $env:PYTHONIOENCODING=\"utf-8\"; python bot.py)",
+      "Bash(python *)",
+      "PowerShell(Remove-Item *)"
+    ]
+  }
+}
