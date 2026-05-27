@@ -26,7 +26,7 @@ from supabase import create_client, Client as SupabaseClient
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from subreddits import CATEGORIES, ALL_SUBS
-from profile import CREATOR_PROFILE, COMPETITORS
+from profile import CREATOR_PROFILE, COMPETITORS, OUR_ACCOUNTS
 
 # Fix Windows console encoding for Cyrillic output
 if sys.platform == "win32":
@@ -103,6 +103,36 @@ def _compact_profile() -> str:
 
 def build_system_prompt(role: str) -> str:
     return f"{role}\n\n{_compact_profile()}"
+
+
+# ─── Account helpers ───────────────────────────────────────────────────────────
+
+def _get_account(acc_type: str) -> dict:
+    """Return SFW or NSFW account dict from OUR_ACCOUNTS."""
+    return next((a for a in OUR_ACCOUNTS if a["type"] == acc_type), {})
+
+
+def _accounts_block() -> str:
+    """Short text block describing our accounts for Claude prompts."""
+    parts = []
+    for acc in OUR_ACCOUNTS:
+        parts.append(
+            f"{acc['type']} аккаунт @{acc['username']}: "
+            f"{acc['post_karma']:,} кармы постов. "
+            f"Контент: {acc['content']}. "
+            f"Использовать для: {acc['use_for']}."
+        )
+    return "НАШИ АККАУНТЫ:\n" + "\n".join(parts)
+
+
+def _accounts_short() -> str:
+    """One-liner for inline references in prompts."""
+    sfw  = _get_account("SFW")
+    nsfw = _get_account("NSFW")
+    return (
+        f"SFW @{sfw.get('username')} ({sfw.get('post_karma',0):,} karma) | "
+        f"NSFW @{nsfw.get('username')} ({nsfw.get('post_karma',0):,} karma)"
+    )
 
 
 # ─── Token usage tracking ──────────────────────────────────────────────────────
@@ -965,12 +995,21 @@ async def run_competitor_analysis(known_subs: set[str]) -> str:
             f"Визуальный анализ: {cd['vision'][:400] if cd['vision'] else 'нет'}"
         )
 
+    sfw_acc  = _get_account("SFW")
+    nsfw_acc = _get_account("NSFW")
+    our_karma_ctx = (
+        f"НАШИ АККАУНТЫ:\n"
+        f"• SFW @{sfw_acc.get('username')}: {sfw_acc.get('post_karma',0):,} кармы\n"
+        f"• NSFW @{nsfw_acc.get('username')}: {nsfw_acc.get('post_karma',0):,} кармы\n"
+    )
+
     try:
         raw_analysis = await asyncio.to_thread(
             ask_openrouter,
             build_system_prompt(
                 "Ты эксперт по конкурентному анализу OnlyFans/Reddit. "
-                "Пиши на русском, структурированно и actionable."
+                "Пиши на русском, структурированно и actionable.\n\n"
+                + our_karma_ctx
             ),
             f"ДАННЫЕ КОНКУРЕНТОВ:\n\n" + "\n\n---\n\n".join(comp_ctx_parts) + "\n\n"
             "Составь трёхуровневый анализ СТРОГО в этом формате:\n\n"
@@ -987,6 +1026,8 @@ async def run_competitor_analysis(known_subs: set[str]) -> str:
             "- Новые темы/ниши которые они осваивают\n"
             "- Где резкий рост апвоутов — горячая аудитория\n"
             "- Что адаптировать под нашу внешность (учитывай copy_style каждого конкурента)\n"
+            "- Сравни карму конкурентов с нашими аккаунтами: "
+            f"наш NSFW {nsfw_acc.get('post_karma',0):,} карм — открывает ли это сабы которые они используют?\n"
             "LEVEL2_END\n\n"
             "LEVEL3_START\n"
             "NEW_SUBS: sub1,sub2,sub3\n"
@@ -1244,14 +1285,16 @@ async def run_weekly_plan(app) -> None:
 
     try:
         raw_groups = ask_openrouter(
-            build_system_prompt("Ты Reddit-стратег, отвечай на русском."),
+            build_system_prompt("Ты Reddit-стратег, отвечай на русском.\n\n" + _accounts_block()),
             f"Неделя {date_str}. Данные:\n" + "\n".join(ctx_lines) + vision_ctx + "\n\n"
             "Верни ТОЛЬКО в таком формате (ничего лишнего):\n"
-            "OVERVIEW: [3-5 предложений — фокус недели, что модно, на что бить]\n"
+            "OVERVIEW: [3-5 предложений — фокус недели, что модно, на что бить. "
+            f"Упомяни распределение по аккаунтам: SFW @{_get_account('SFW').get('username')} / "
+            f"NSFW @{_get_account('NSFW').get('username')}]\n"
             "GROUP: [эмодзи Название] | sub1,sub2,sub3\n"
             "GROUP: ...\n"
             "Сделай 4-5 групп. Все 15 сабов распредели по группам.",
-            max_tokens=400,
+            max_tokens=450,
         )
     except Exception as e:
         logger.error("Step 4 groups failed: %s", e)
@@ -1380,9 +1423,18 @@ async def callback_weekly_subgroup(update: Update, context: ContextTypes.DEFAULT
             f"  ПОЛНЫЕ ПРАВИЛА:\n{d['rules']}"
         )
 
+    sfw_acc  = _get_account("SFW")
+    nsfw_acc = _get_account("NSFW")
+
     system_with_rules = build_system_prompt(
         f"Ты Reddit-стратег, составляешь детальный план для группы '{group_name}'. "
         "Отвечай на русском.\n\n"
+        f"{_accounts_block()}\n\n"
+        "ACCOUNT SELECTION RULE:\n"
+        f"Для каждого саба выбирай ОДИН аккаунт:\n"
+        f"• SFW сабы (косплей, альт, лайфстайл, без наготы) → @{sfw_acc.get('username')} ({sfw_acc.get('post_karma',0):,} karma)\n"
+        f"• NSFW сабы (explicit, фетиш, ахегао, грудь, взрослый контент) → @{nsfw_acc.get('username')} ({nsfw_acc.get('post_karma',0):,} karma)\n"
+        f"Если саб требует высокую карму — у NSFW аккаунта {nsfw_acc.get('post_karma',0):,} кармы, это открывает доступ к строгим сабам.\n\n"
         "STRICT RULES ENFORCEMENT:\n"
         "Перед планом каждого саба ты ОБЯЗАН:\n"
         "1. Прочитать ВСЕ правила саба\n"
@@ -1410,6 +1462,7 @@ async def callback_weekly_subgroup(update: Update, context: ContextTypes.DEFAULT
             "✅ Правило #2 — ок\n"
             "❌ Правило #N — [нарушение], убрали [X] из плана\n"
             "[все правила]\n\n"
+            f"👤 Аккаунт: [@username] ([karma] кармы) — [одна строка почему этот аккаунт]\n\n"
             "📌 Что постить: [конкретно, соответствует правилам]\n"
             "🎬 Как снять: [поза, свет, ракурс]\n"
             "✍️ Подпись: [готовый текст]\n"

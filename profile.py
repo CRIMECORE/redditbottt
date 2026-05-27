@@ -38,6 +38,24 @@ CREATOR_PROFILE = {
     "open_to": "New niche fetishes and emerging trends if they drive traffic. Claude should think beyond obvious categories and find unexpected subreddit connections.",
 }
 
+# Our Reddit accounts
+OUR_ACCOUNTS = [
+    {
+        "username": "LetRevolutiona",
+        "type": "SFW",
+        "post_karma": 36122,
+        "content": "косплеи, наряды, альт образы — без наготы",
+        "use_for": "SFW сабреддиты, косплей сабы, альт сабы, воронка для трафика",
+    },
+    {
+        "username": "an3l32mi",
+        "type": "NSFW",
+        "post_karma": 110730,
+        "content": "сиськи, фетиш, ахегао, тизинг и тд",
+        "use_for": "NSFW сабреддиты, фетиш сабы, explicit контент",
+    },
+]
+
 # Competitors to track each week
 COMPETITORS = [
     {
