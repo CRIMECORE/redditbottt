@@ -380,7 +380,10 @@ def ask_openrouter(system_prompt: str, user_message: str, max_tokens: int = 1024
     _tok["in"] += usage.get("prompt_tokens", 0)
     _tok["out"] += usage.get("completion_tokens", 0)
     _tok["calls"] += 1
-    return data["choices"][0]["message"]["content"]
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as e:
+        raise ValueError(f"Unexpected OpenRouter response: {data}") from e
 
 
 def ask_openrouter_vision(images_b64: list[str], text_prompt: str) -> str:
@@ -409,7 +412,10 @@ def ask_openrouter_vision(images_b64: list[str], text_prompt: str) -> str:
     _tok["in"] += usage.get("prompt_tokens", 0)
     _tok["out"] += usage.get("completion_tokens", 0)
     _tok["calls"] += 1
-    return data["choices"][0]["message"]["content"]
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as e:
+        raise ValueError(f"Unexpected OpenRouter vision response: {data}") from e
 
 
 # ─── Step 0: web-search tool helpers ──────────────────────────────────────────
@@ -553,7 +559,7 @@ def step0_find_subs_from_keywords(keywords: list[str]) -> list[str]:
                 timeout=10,
             )
             for child in r.json().get("data", {}).get("children", []):
-                d = child["data"]
+                d = child.get("data", {})
                 subs_count = d.get("subscribers") or 0
                 name = d.get("display_name", "")
                 if subs_count >= 10_000 and name and name not in seen:
@@ -597,7 +603,7 @@ def fetch_competitor_posts(username: str, limit: int = 10) -> list[dict]:
     )
     r.raise_for_status()
     children = r.json().get("data", {}).get("children", [])
-    return [c["data"] for c in children[:limit]]
+    return [c["data"] for c in children[:limit] if c.get("data")]
 
 
 def db_save_competitor_insight(
@@ -700,7 +706,8 @@ def db_get_previous_insights(limit: int = 4) -> str:
         parts = []
         for r in reversed(rows):
             parts.append(
-                f"Неделя {r['week_start']}–{r['week_end']}:\n{r['analysis'][:300]}..."
+                f"Неделя {r.get('week_start','?')}–{r.get('week_end','?')}:\n"
+                f"{r.get('analysis','')[:300]}..."
             )
         return "\n\n".join(parts)
     except Exception as e:
@@ -1168,8 +1175,8 @@ async def run_weekly_plan(app) -> None:
     trend_summary = ""
     discovered_subs: list[str] = []
     try:
-        trend_keywords, trend_summary = step0_search_trends()
-        discovered_subs = step0_find_subs_from_keywords(trend_keywords)
+        trend_keywords, trend_summary = await asyncio.to_thread(step0_search_trends)
+        discovered_subs = await asyncio.to_thread(step0_find_subs_from_keywords, trend_keywords)
         await broadcast(
             f"Шаг 0 готов. Трендов: {len(trend_keywords)}, "
             f"новых сабов: {len(discovered_subs)}"
@@ -1179,7 +1186,7 @@ async def run_weekly_plan(app) -> None:
         await broadcast("Шаг 0: веб-поиск не удался, продолжаю.")
 
     # ── Step 1: select top-15 subs ────────────────────────────────────────────
-    db_subs = db_get_active_sub_names()
+    db_subs = await asyncio.to_thread(db_get_active_sub_names)
     base_pool = db_subs if db_subs else ALL_SUBS
     combined_pool = list(dict.fromkeys(base_pool + discovered_subs))
     subs_joined  = ", ".join(combined_pool)
@@ -1188,12 +1195,13 @@ async def run_weekly_plan(app) -> None:
         if trend_keywords else ""
     )
     try:
-        raw = ask_openrouter(
+        raw = await asyncio.to_thread(
+            ask_openrouter,
             build_system_prompt("Ты Reddit-стратег для создателя контента для взрослых."),
             f"{trend_context}Из списка выбери топ-15 сабреддитов для OnlyFans/Fansly продвижения "
             f"на эту неделю. Список: {subs_joined}. "
             "Верни только названия через запятую, без r/, без объяснений.",
-            max_tokens=256,
+            256,
         )
         selected = [s.strip().lstrip("r/") for s in raw.split(",")][:20]
         valid = {s.lower() for s in combined_pool}
@@ -1202,10 +1210,11 @@ async def run_weekly_plan(app) -> None:
         logger.error("Step 1 failed: %s", e)
         selected = combined_pool[:20]
 
-    # Filter: banned subs, drawn content, banned mods
+    # Filter: banned subs, drawn content, banned mods (each call makes HTTP requests)
     filtered_selected: list[str] = []
     for s in selected:
-        if not is_sub_allowed(s):
+        allowed = await asyncio.to_thread(is_sub_allowed, s)
+        if not allowed:
             logger.info("Filtered out r/%s from plan", s)
             continue
         filtered_selected.append(s)
@@ -1220,26 +1229,27 @@ async def run_weekly_plan(app) -> None:
     low_traffic: list[str] = []
     for sub in selected:
         try:
-            posts = fetch_top_posts_week(sub, limit=10)
-            rules = fetch_subreddit_rules(sub)
+            posts = await asyncio.to_thread(fetch_top_posts_week, sub, 10)
+            rules = await asyncio.to_thread(fetch_subreddit_rules, sub)
         except Exception as e:
             logger.warning("Step 2 r/%s: %s", sub, e)
             posts, rules = [], "unavailable"
+        if not posts:
+            logger.info("r/%s returned no posts — skipping", sub)
+            continue
         sub_avg = avg_upvotes(posts)
-        if posts and sub_avg < UPVOTES_SKIP:
+        if sub_avg < UPVOTES_SKIP:
             low_traffic.append(f"{sub}(avg {sub_avg:.0f})")
             logger.info("r/%s avg upvotes %.0f < %d — skipping", sub, sub_avg, UPVOTES_SKIP)
             continue
-        if sub_avg < UPVOTES_MID:
-            activity_label = "⚠️ Средняя активность"
-        else:
-            activity_label = "✅ Высокая активность"
-        fmt = analyze_post_format(posts)
-        video_policy = detect_video_policy(posts)
+        activity_label = "⚠️ Средняя активность" if sub_avg < UPVOTES_MID else "✅ Высокая активность"
         subs_data[sub] = {
-            "posts": posts, "rules": rules, "format": fmt,
-            "video_policy": video_policy,
-            "activity": activity_label, "avg_upvotes": round(sub_avg),
+            "posts": posts,
+            "rules": rules,
+            "format": analyze_post_format(posts),
+            "video_policy": detect_video_policy(posts),
+            "activity": activity_label,
+            "avg_upvotes": round(sub_avg),
         }
     if low_traffic:
         await broadcast(f"Исключены (avg < {UPVOTES_SKIP} апвоутов/неделю): " + ", ".join(low_traffic))
@@ -1256,14 +1266,19 @@ async def run_weekly_plan(app) -> None:
     vision_analysis = ""
     top3 = all_imgs[:3]
     if top3:
-        b64s = [b for _, _, u in top3 if (b := download_image_base64(u))]
+        b64s: list[str] = []
+        for _, _, u in top3:
+            b = await asyncio.to_thread(download_image_base64, u)
+            if b:
+                b64s.append(b)
         if b64s:
             src = " | ".join(f"r/{s}(👍{sc})" for sc, s, _ in top3[:len(b64s)])
             try:
-                vision_analysis = ask_openrouter_vision(
+                vision_analysis = await asyncio.to_thread(
+                    ask_openrouter_vision,
                     b64s,
                     f"{_compact_profile()}\nФото из: {src}\n"
-                    "3-4 предложения: поза, стиль, что воспроизвести."
+                    "3-4 предложения: поза, стиль, что воспроизвести.",
                 )
             except Exception as e:
                 logger.warning("Vision failed: %s", e)
@@ -1284,7 +1299,8 @@ async def run_weekly_plan(app) -> None:
     vision_ctx = f"\nВизуал: {vision_analysis[:180]}" if vision_analysis else ""
 
     try:
-        raw_groups = ask_openrouter(
+        raw_groups = await asyncio.to_thread(
+            ask_openrouter,
             build_system_prompt("Ты Reddit-стратег, отвечай на русском.\n\n" + _accounts_block()),
             f"Неделя {date_str}. Данные:\n" + "\n".join(ctx_lines) + vision_ctx + "\n\n"
             "Верни ТОЛЬКО в таком формате (ничего лишнего):\n"
@@ -1294,7 +1310,7 @@ async def run_weekly_plan(app) -> None:
             "GROUP: [эмодзи Название] | sub1,sub2,sub3\n"
             "GROUP: ...\n"
             "Сделай 4-5 групп. Все 15 сабов распредели по группам.",
-            max_tokens=450,
+            450,
         )
     except Exception as e:
         logger.error("Step 4 groups failed: %s", e)
@@ -1487,14 +1503,19 @@ async def callback_weekly_subgroup(update: Update, context: ContextTypes.DEFAULT
     header = f"{group_name} — план на неделю {date_str}\n"
 
     # Split by the "━━━" marker, keeping each sub block intact
+    # Lines before the first marker are prepended to the first block
     sub_blocks: list[str] = []
-    for block in detail.split("\n"):
-        if block.startswith("━━━"):
-            sub_blocks.append(block)
-        elif sub_blocks:
-            sub_blocks[-1] += "\n" + block
+    current_block = ""
+    for line in detail.split("\n"):
+        if line.startswith("━━━"):
+            if current_block:
+                sub_blocks.append(current_block)
+            current_block = line
+        else:
+            current_block = (current_block + "\n" + line) if current_block else line
+    if current_block:
+        sub_blocks.append(current_block)
 
-    # Merge short trailing lines into last block
     final_blocks = [b.strip() for b in sub_blocks if b.strip()]
     if not final_blocks:
         # Fallback: send as-is
