@@ -771,24 +771,48 @@ def split_by_blocks(header: str, blocks: list[str], max_len: int = 3800) -> list
 
 
 async def send_long_message(bot, chat_id: int, text: str) -> None:
-    """Send text splitting only on double newlines, never mid-block. Max 4000 chars per part."""
-    if len(text) <= 4000:
+    """Split text into ≤4000-char messages and send them sequentially.
+    Content is NEVER truncated — continues in the next message.
+    Split priority: double newline → single newline → space (word boundary)."""
+    MAX = 4000
+
+    if len(text) <= MAX:
         await bot.send_message(chat_id=chat_id, text=text)
         return
-    paragraphs = text.split("\n\n")
+
     chunks: list[str] = []
     current = ""
-    for para in paragraphs:
-        candidate = (current + "\n\n" + para) if current else para
-        if len(candidate) > 4000:
+
+    for block in text.split("\n\n"):
+        sep = "\n\n" if current else ""
+        if len(current) + len(sep) + len(block) <= MAX:
+            current += sep + block
+        else:
             if current:
                 chunks.append(current)
-            # Truncate at word boundary to avoid cutting mid-word
-            current = para if len(para) <= 4000 else para[:3999].rsplit(" ", 1)[0] + "…"
-        else:
-            current = candidate
+                current = ""
+            # Block itself may exceed MAX — split by single newline
+            for line in block.split("\n"):
+                sep2 = "\n" if current else ""
+                if len(current) + len(sep2) + len(line) <= MAX:
+                    current += sep2 + line
+                else:
+                    if current:
+                        chunks.append(current)
+                        current = ""
+                    # Line itself may exceed MAX — split by words
+                    for word in line.split(" "):
+                        sep3 = " " if current else ""
+                        if len(current) + len(sep3) + len(word) <= MAX:
+                            current += sep3 + word
+                        else:
+                            if current:
+                                chunks.append(current)
+                            current = word
+
     if current:
         chunks.append(current)
+
     for i, chunk in enumerate(chunks):
         await bot.send_message(chat_id=chat_id, text=chunk)
         if i < len(chunks) - 1:
