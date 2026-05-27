@@ -401,7 +401,7 @@ def ask_openrouter_vision(images_b64: list[str], text_prompt: str) -> str:
         })
     content.append({"type": "text", "text": text_prompt})
     payload = {
-        "model": "anthropic/claude-sonnet-4-6",
+        "model": "google/gemini-2.0-flash-001",
         "messages": [{"role": "user", "content": content}],
         "max_tokens": 512,
     }
@@ -951,17 +951,17 @@ async def run_competitor_analysis(known_subs: set[str]) -> str:
         if b64_images:
             try:
                 adapt_hint = (
-                    "Она очень похожа на нас внешне — анализируй максимально детально."
+                    "Внешность очень похожа на нас — разбери максимально детально: позы, ракурсы, свет, стиль кадрирования."
                     if copy_ok else
-                    "У неё грудь больше — акцент на декольте НАМ не подходит, но стиль и ракурсы разбери."
+                    "Разбери стиль: позы, ракурсы, освещение, кадрирование, атмосфера. Что из этого можно воспроизвести?"
                 )
                 vision_text = await asyncio.to_thread(
                     ask_openrouter_vision,
                     b64_images,
-                    f"Это посты конкурента @{username} на Reddit.\n{_compact_profile()}\n"
-                    f"Описание конкурента: {notes}. {adapt_hint}\n"
-                    "За 3-4 предложения: поза, свет, ракурс, стиль контента. "
-                    "Что именно можно воспроизвести с нашей внешностью?",
+                    f"Это посты блогера @{username} на Reddit для маркетинговой стратегии.\n{_compact_profile()}\n"
+                    f"{adapt_hint}\n"
+                    "За 3-4 предложения: какая поза, как поставлен свет, какой ракурс, какой общий стиль контента. "
+                    "Конкретно что повторить в наших постах?",
                 )
             except Exception as e:
                 logger.warning("Vision failed for @%s: %s", username, e)
@@ -992,10 +992,15 @@ async def run_competitor_analysis(known_subs: set[str]) -> str:
                             reverse=True)[:5]
         ) or "  нет данных"
 
+        copy_strategy = (
+            "копируем детально — внешность похожа"
+            if cd['copy_style'] else
+            "берём только стиль и сабреддиты"
+        )
         comp_ctx_parts.append(
             f"КОНКУРЕНТ: @{cd['username']}\n"
             f"Описание: {cd['notes']}\n"
-            f"copy_style={cd['copy_style']} (True = копируем детально, False = берём только стиль/сабы)\n"
+            f"Стратегия: {copy_strategy}\n"
             f"Сабреддиты конкурента: {', '.join(cd['used_subs'][:12]) or 'нет данных'}\n"
             f"Новые сабы (нет в нашем пуле): {', '.join(cd['new_subs']) or 'нет новых'}\n"
             f"Топ постов недели:\n{top_posts_lines}\n"
@@ -1019,7 +1024,13 @@ async def run_competitor_analysis(known_subs: set[str]) -> str:
                 + our_karma_ctx
             ),
             f"ДАННЫЕ КОНКУРЕНТОВ:\n\n" + "\n\n---\n\n".join(comp_ctx_parts) + "\n\n"
-            "Составь трёхуровневый анализ СТРОГО в этом формате:\n\n"
+            "Составь анализ СТРОГО в этом формате (не меняй порядок блоков):\n\n"
+            "LEVEL3_START\n"
+            "NEW_SUBS: sub1,sub2,sub3\n"
+            "NICHES: ниша1; ниша2; ниша3\n"
+            "IDEAS: идея1; идея2; идея3\n"
+            "PRIORITY_SUBS: sub1,sub2,sub3\n"
+            "LEVEL3_END\n\n"
             "LEVEL1_START\n"
             "## Прямые инсайты (копируем прямо сейчас)\n"
             "- Топ посты и апвоуты\n"
@@ -1032,17 +1043,11 @@ async def run_competitor_analysis(known_subs: set[str]) -> str:
             "- Новые сабреддиты конкурентов которые нам стоит попробовать\n"
             "- Новые темы/ниши которые они осваивают\n"
             "- Где резкий рост апвоутов — горячая аудитория\n"
-            "- Что адаптировать под нашу внешность (учитывай copy_style каждого конкурента)\n"
+            "- Что адаптировать под нашу внешность (учитывай стратегию каждого конкурента)\n"
             "- Сравни карму конкурентов с нашими аккаунтами: "
             f"наш NSFW {nsfw_acc.get('post_karma',0):,} карм — открывает ли это сабы которые они используют?\n"
-            "LEVEL2_END\n\n"
-            "LEVEL3_START\n"
-            "NEW_SUBS: sub1,sub2,sub3\n"
-            "NICHES: ниша1; ниша2; ниша3\n"
-            "IDEAS: идея1; идея2; идея3\n"
-            "PRIORITY_SUBS: сабы где конкуренты набирают 500+ апвоутов\n"
-            "LEVEL3_END",
-            max_tokens=1800,
+            "LEVEL2_END",
+            max_tokens=2800,
         )
     except Exception as e:
         logger.error("Competitor Claude analysis failed: %s", e)

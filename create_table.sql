@@ -36,3 +36,24 @@ CREATE POLICY allow_all ON public.weekly_insights
     FOR ALL TO anon
     USING (true)
     WITH CHECK (true);
+
+-- ─── competitor_insights ───────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS public.competitor_insights (
+    id                  BIGSERIAL PRIMARY KEY,
+    week_start          DATE NOT NULL,
+    competitor_username TEXT NOT NULL,
+    new_subreddits      JSONB DEFAULT '[]',
+    top_subreddits      JSONB DEFAULT '[]',
+    content_ideas       JSONB DEFAULT '[]',
+    priority_subs       JSONB DEFAULT '[]',
+    raw_analysis        TEXT,
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE public.competitor_insights ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY allow_all ON public.competitor_insights
+    FOR ALL TO anon
+    USING (true)
+    WITH CHECK (true);
