@@ -558,15 +558,16 @@ def step0_find_subs_from_keywords(keywords: list[str]) -> list[str]:
 # ─── Competitor helpers ───────────────────────────────────────────────────────
 
 def fetch_competitor_posts(username: str, limit: int = 10) -> list[dict]:
-    """Fetch top posts of the week for a Reddit user via ScrapeCreators."""
-    url = f"{SCRAPECREATORS_BASE}/user"
-    headers = {"x-api-key": SCRAPECREATORS_API_KEY}
-    params = {"username": username, "type": "top", "t": "week", "limit": limit}
-    r = requests.get(url, headers=headers, params=params, timeout=15)
+    """Fetch top posts of the week for a Reddit user via Reddit's native JSON API."""
+    r = requests.get(
+        f"https://www.reddit.com/user/{username}/submitted.json",
+        headers=REDDIT_HEADERS,
+        params={"sort": "top", "t": "week", "limit": limit},
+        timeout=15,
+    )
     r.raise_for_status()
-    data = r.json()
-    posts = data.get("posts") or data.get("data") or []
-    return posts[:limit]
+    children = r.json().get("data", {}).get("children", [])
+    return [c["data"] for c in children[:limit]]
 
 
 def db_save_competitor_insight(
