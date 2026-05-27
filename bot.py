@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 import json
@@ -21,16 +22,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
 from supabase import create_client, Client as SupabaseClient
-
-import csv
-import io
-
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials as _GCredentials
-    _HAS_GSPREAD = True
-except ImportError:
-    _HAS_GSPREAD = False
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -62,6 +53,16 @@ SCRAPECREATORS_BASE = "https://api.scrapecreators.com/v1/reddit"
 OPENROUTER_BASE = "https://openrouter.ai/api/v1/chat/completions"
 REDDIT_HEADERS = {"User-Agent": "SubFinderBot/1.0"}
 FINDSUBS_KEYWORDS = ["cosplay", "anime", "fetish", "gamer girl", "latex", "alternative", "goth", "NSFW"]
+
+BANNED_SUBS = frozenset({"ResidentEvil", "DunderMifflin"})
+BANNED_MODS = frozenset({"louise mania", "mad dickson", "pessimist", "rick spanish"})
+DRAWN_CONTENT_SUBS = frozenset({
+    "AnimeArt", "hentai", "animeart", "GoneWildAnime", "AnimeGirlsNSFW",
+    "anime", "AnimeGirls", "HentaiAi", "rule34", "rule34ai", "hentai_gif",
+    "ecchi", "doujinshi", "Moescape", "AmateurRoomPorn",
+})
+UPVOTES_SKIP = 50    # avg below this → exclude sub
+UPVOTES_MID  = 100   # avg 50-99 → include with warning label
 
 CALLBACK_WEEKLY    = "weekly_analyze"
 CALLBACK_SUBGROUP  = "wk_sg"        # wk_sg_0 … wk_sg_4
@@ -227,6 +228,17 @@ def fetch_top_posts_24h(subreddit: str, limit: int = 5) -> list[dict]:
     return posts[:limit]
 
 
+def fetch_top_posts_week(subreddit: str, limit: int = 10) -> list[dict]:
+    url = f"{SCRAPECREATORS_BASE}/subreddit"
+    headers = {"x-api-key": SCRAPECREATORS_API_KEY}
+    params = {"subreddit": subreddit, "type": "top", "t": "week", "limit": limit}
+    r = requests.get(url, headers=headers, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    posts = data.get("posts") or data.get("data") or []
+    return posts[:limit]
+
+
 def fetch_subreddit_rules(subreddit: str) -> str:
     try:
         r = requests.get(
@@ -235,9 +247,56 @@ def fetch_subreddit_rules(subreddit: str) -> str:
             timeout=10,
         )
         rules = r.json().get("rules", [])
-        return "; ".join(rule.get("short_name", "") for rule in rules[:5]) or "No rules found"
+        if not rules:
+            return "No rules found"
+        parts = []
+        for i, rule in enumerate(rules, 1):
+            name = rule.get("short_name", "").strip()
+            desc = (rule.get("description") or "").strip()[:300]
+            line = f"Rule #{i}: {name}"
+            if desc:
+                line += f" — {desc}"
+            parts.append(line)
+        return "\n".join(parts)
     except Exception:
         return "Rules unavailable"
+
+
+def fetch_subreddit_mods(subreddit: str) -> list[str]:
+    try:
+        r = requests.get(
+            f"https://www.reddit.com/r/{subreddit}/about/moderators.json",
+            headers=REDDIT_HEADERS,
+            timeout=10,
+        )
+        data = r.json().get("data", {}).get("children", [])
+        return [m.get("name", "").lower() for m in data]
+    except Exception:
+        return []
+
+
+def is_sub_allowed(sub: str) -> bool:
+    if sub in BANNED_SUBS or sub.lower() in {s.lower() for s in BANNED_SUBS}:
+        return False
+    if sub in DRAWN_CONTENT_SUBS or sub.lower() in {s.lower() for s in DRAWN_CONTENT_SUBS}:
+        return False
+    mods = fetch_subreddit_mods(sub)
+    if any(mod in BANNED_MODS for mod in mods):
+        logger.info("Skipping r/%s — banned moderator found", sub)
+        return False
+    return True
+
+
+def detect_video_policy(posts: list[dict]) -> str:
+    video_count = sum(1 for p in posts if p.get("is_video") or "v.redd.it" in str(p.get("url", "")))
+    if video_count >= 2:
+        return "📹 Видео: можно постить напрямую"
+    return "📹 Видео: используй Redgifs (прямые видео не работают в этом сабе)"
+
+
+def avg_upvotes(posts: list[dict]) -> float:
+    scores = [p.get("score") or p.get("ups") or 0 for p in posts]
+    return sum(scores) / len(scores) if scores else 0
 
 
 def extract_image_urls(posts: list[dict]) -> list[str]:
@@ -468,6 +527,8 @@ def step0_find_subs_from_keywords(keywords: list[str]) -> list[str]:
                 subs_count = d.get("subscribers") or 0
                 name = d.get("display_name", "")
                 if subs_count >= 10_000 and name and name not in seen:
+                    if name in BANNED_SUBS or name.lower() in {s.lower() for s in DRAWN_CONTENT_SUBS}:
+                        continue
                     seen[name] = subs_count
         except Exception as e:
             logger.warning("Subreddit search for '%s' failed: %s", kw, e)
@@ -602,9 +663,9 @@ async def callback_analyze_weekly(update: Update, context: ContextTypes.DEFAULT_
 
     chat_id = query.message.chat_id
 
-    # Read sheet
+    # Read sheet (run in thread to avoid blocking event loop)
     try:
-        rows = read_google_sheet(SHEET_ID)
+        rows = await asyncio.to_thread(read_google_sheet, SHEET_ID)
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"Ошибка чтения таблицы:\n{e}")
         return
@@ -629,7 +690,8 @@ async def callback_analyze_weekly(update: Update, context: ContextTypes.DEFAULT_
 
     table_text = format_sheet_for_claude(rows)
 
-    analysis = ask_openrouter(
+    analysis = await asyncio.to_thread(
+        ask_openrouter,
         build_system_prompt(
             "Ты аналитик еженедельной статистики Reddit-продвижения для создателя контента. "
             "Отвечай на русском, конкретно и actionable."
@@ -645,7 +707,7 @@ async def callback_analyze_weekly(update: Update, context: ContextTypes.DEFAULT_
         "5. ПОДПИСЧИКИ OF/FANSLY — сколько пришло и откуда\n"
         "6. ТРЕНД — растём / падаем / стагнация, почему\n"
         "7. РЕКОМЕНДАЦИИ — 3 конкретных действия на следующую неделю",
-        max_tokens=1400,
+        1400,
     )
 
     # Send report
@@ -653,8 +715,7 @@ async def callback_analyze_weekly(update: Update, context: ContextTypes.DEFAULT_
         f"📊 Аналитика {week_start.strftime('%d.%m')}–{week_end.strftime('%d.%m.%Y')}\n\n"
     )
     full = header + analysis
-    for i in range(0, len(full), 4000):
-        await context.bot.send_message(chat_id=chat_id, text=full[i : i + 4000])
+    await send_long_message(context.bot, chat_id, full)
 
     # Save to Supabase
     db_save_weekly_insight(week_start, week_end, rows, analysis)
@@ -707,6 +768,31 @@ def split_by_blocks(header: str, blocks: list[str], max_len: int = 3800) -> list
     if current:
         messages.append(current)
     return messages or [header]
+
+
+async def send_long_message(bot, chat_id: int, text: str) -> None:
+    """Send text splitting only on double newlines, never mid-block. Max 4000 chars per part."""
+    if len(text) <= 4000:
+        await bot.send_message(chat_id=chat_id, text=text)
+        return
+    paragraphs = text.split("\n\n")
+    chunks: list[str] = []
+    current = ""
+    for para in paragraphs:
+        candidate = (current + "\n\n" + para) if current else para
+        if len(candidate) > 4000:
+            if current:
+                chunks.append(current)
+            # Truncate at word boundary to avoid cutting mid-word
+            current = para if len(para) <= 4000 else para[:3999].rsplit(" ", 1)[0] + "…"
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    for i, chunk in enumerate(chunks):
+        await bot.send_message(chat_id=chat_id, text=chunk)
+        if i < len(chunks) - 1:
+            await asyncio.sleep(0.5)
 
 
 # ─── Daily plan pipeline ───────────────────────────────────────────────────────
@@ -764,26 +850,54 @@ async def run_weekly_plan(app) -> None:
             "Верни только названия через запятую, без r/, без объяснений.",
             max_tokens=256,
         )
-        selected = [s.strip().lstrip("r/") for s in raw.split(",")][:15]
+        selected = [s.strip().lstrip("r/") for s in raw.split(",")][:20]
         valid = {s.lower() for s in combined_pool}
-        selected = [s for s in selected if s.lower() in valid] or combined_pool[:15]
+        selected = [s for s in selected if s.lower() in valid] or combined_pool[:20]
     except Exception as e:
         logger.error("Step 1 failed: %s", e)
-        selected = combined_pool[:15]
+        selected = combined_pool[:20]
+
+    # Filter: banned subs, drawn content, banned mods
+    filtered_selected: list[str] = []
+    for s in selected:
+        if not is_sub_allowed(s):
+            logger.info("Filtered out r/%s from plan", s)
+            continue
+        filtered_selected.append(s)
+        if len(filtered_selected) == 15:
+            break
+    selected = filtered_selected or selected[:15]
 
     await broadcast("Шаг 1 готов: " + ", ".join(f"r/{s}" for s in selected))
 
-    # ── Step 2: fetch top-5 posts + rules + format ────────────────────────────
+    # ── Step 2: fetch top-10 posts (week) + rules + format ───────────────────
     subs_data: dict[str, dict] = {}
+    low_traffic: list[str] = []
     for sub in selected:
         try:
-            posts = fetch_top_posts_24h(sub, limit=5)
+            posts = fetch_top_posts_week(sub, limit=10)
             rules = fetch_subreddit_rules(sub)
         except Exception as e:
             logger.warning("Step 2 r/%s: %s", sub, e)
             posts, rules = [], "unavailable"
+        sub_avg = avg_upvotes(posts)
+        if posts and sub_avg < UPVOTES_SKIP:
+            low_traffic.append(f"{sub}(avg {sub_avg:.0f})")
+            logger.info("r/%s avg upvotes %.0f < %d — skipping", sub, sub_avg, UPVOTES_SKIP)
+            continue
+        if sub_avg < UPVOTES_MID:
+            activity_label = "⚠️ Средняя активность"
+        else:
+            activity_label = "✅ Высокая активность"
         fmt = analyze_post_format(posts)
-        subs_data[sub] = {"posts": posts, "rules": rules, "format": fmt}
+        video_policy = detect_video_policy(posts)
+        subs_data[sub] = {
+            "posts": posts, "rules": rules, "format": fmt,
+            "video_policy": video_policy,
+            "activity": activity_label, "avg_upvotes": round(sub_avg),
+        }
+    if low_traffic:
+        await broadcast(f"Исключены (avg < {UPVOTES_SKIP} апвоутов/неделю): " + ", ".join(low_traffic))
     await broadcast("Шаг 2 готов. Посты и правила загружены.")
 
     # ── Step 3: single vision call ────────────────────────────────────────────
@@ -813,9 +927,14 @@ async def run_weekly_plan(app) -> None:
     # ── Step 4: generate overview + subgroups ─────────────────────────────────
     ctx_lines = []
     for sub in selected:
+        if sub not in subs_data:
+            continue
         d = subs_data[sub]
         titles = " | ".join(p.get("title","")[:35] for p in d["posts"][:2])
-        ctx_lines.append(f"r/{sub}[{d['format']}]: {titles} | rules:{d['rules'][:60]}")
+        ctx_lines.append(
+            f"r/{sub}[{d['format']}][{d['activity']} avg:{d['avg_upvotes']}]: "
+            f"{titles} | rules:{d['rules'][:60]}"
+        )
 
     vision_ctx = f"\nВизуал: {vision_analysis[:180]}" if vision_analysis else ""
 
@@ -865,7 +984,10 @@ async def run_weekly_plan(app) -> None:
     for cid in chat_ids:
         try:
             await app.bot.send_message(chat_id=cid, text=header_text, reply_markup=keyboard)
-            # Store plan in cache for this chat
+            # Store plan in cache for this chat (evict old entries if cache grows too large)
+            if len(_weekly_cache) > 50:
+                oldest = next(iter(_weekly_cache))
+                del _weekly_cache[oldest]
             _weekly_cache[cid] = {
                 "subgroups": subgroups,
                 "subs_data": subs_data,
@@ -883,7 +1005,6 @@ async def run_weekly_plan(app) -> None:
 
 async def callback_weekly_subgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
     chat_id = query.message.chat_id
 
     # Parse group index from callback_data like "wk_sg_2"
@@ -892,6 +1013,8 @@ async def callback_weekly_subgroup(update: Update, context: ContextTypes.DEFAULT
     except (ValueError, IndexError):
         await query.answer("Ошибка данных кнопки")
         return
+
+    await query.answer()  # answer only once, after successful parsing
 
     cache = _weekly_cache.get(chat_id)
     if not cache:
@@ -924,30 +1047,63 @@ async def callback_weekly_subgroup(update: Update, context: ContextTypes.DEFAULT
     sub_ctx = []
     for sub in group_subs:
         d = subs_data[sub]
-        titles = " | ".join(p.get("title", "")[:50] for p in d["posts"][:3])
+        titles = " | ".join(p.get("title", "")[:60] for p in d["posts"][:3])
+        video_pol = d.get("video_policy", "📹 Видео: уточни")
+        activity = d.get("activity", "")
+        avg_up = d.get("avg_upvotes", 0)
         sub_ctx.append(
-            f"r/{sub} | Формат: {d['format']} | "
-            f"Топ-посты: {titles} | Правила: {d['rules'][:100]}"
+            f"r/{sub}\n"
+            f"  Активность: {activity} (avg {avg_up} апвоутов/неделю)\n"
+            f"  Формат: {d['format']} | {video_pol}\n"
+            f"  Топ-посты: {titles}\n"
+            f"  ПОЛНЫЕ ПРАВИЛА:\n{d['rules']}"
         )
 
+    system_with_rules = build_system_prompt(
+        f"Ты Reddit-стратег, составляешь детальный план для группы '{group_name}'. "
+        "Отвечай на русском.\n\n"
+        "STRICT RULES ENFORCEMENT:\n"
+        "Перед планом каждого саба ты ОБЯЗАН:\n"
+        "1. Прочитать ВСЕ правила саба\n"
+        "2. Проверить каждый пункт плана против КАЖДОГО правила\n"
+        "3. Если что-то нарушает правила — НЕ предлагать это\n"
+        "4. Для каждого правила указать: ✅ Правило #N — ок ИЛИ ❌ Правило #N — [что нарушает, что убрали]\n"
+        "5. Предложить альтернативу для всего убранного\n\n"
+        "CONTENT TYPE RULE:\n"
+        "Мы постим ТОЛЬКО реальные фото/видео реальных людей.\n"
+        "Никакого рисованного/аниме арт контента в плане.\n\n"
+        "UPVOTE RULE:\n"
+        "Упоминай только контент-стратегии которые реально набирают 100+ апвоутов в этом сабе."
+    )
+
     try:
-        detail = ask_openrouter(
-            build_system_prompt(
-                f"Ты Reddit-стратег, составляешь детальный план для группы '{group_name}'. "
-                "Отвечай на русском."
-            ),
+        detail = await asyncio.to_thread(
+            ask_openrouter,
+            system_with_rules,
             f"{trend_ctx}Неделя {date_str}. Группа: {group_name}\n\n"
-            "Данные по сабам:\n" + "\n".join(sub_ctx) + "\n\n"
-            f"Для каждого из {len(group_subs)} сабов напиши блок строго в формате:\n"
-            "━━━ r/название ━━━\n"
-            "📌 Что постить: [конкретно]\n"
+            "Данные по сабам:\n\n" + "\n\n".join(sub_ctx) + "\n\n"
+            f"Для каждого из {len(group_subs)} сабов напиши блок СТРОГО в формате:\n\n"
+            "━━━ r/название ━━━\n\n"
+            "⚠️ Проверка правил r/название:\n"
+            "✅ Правило #1 — ок\n"
+            "✅ Правило #2 — ок\n"
+            "❌ Правило #N — [нарушение], убрали [X] из плана\n"
+            "[все правила]\n\n"
+            "📌 Что постить: [конкретно, соответствует правилам]\n"
             "🎬 Как снять: [поза, свет, ракурс]\n"
             "✍️ Подпись: [готовый текст]\n"
-            f"{'📷 Формат: [фото/видео и почему]'}\n"
-            "⚠️ Правила: [ключевые ограничения]\n"
+            "[video_policy из данных]\n"
             "⏰ Время: [лучшее время UTC+7]\n\n"
-            "Пиши компактно. Каждый блок отдельно.",
-            max_tokens=1500,
+            "⚠️ CRITICAL REQUIREMENTS:\n"
+            "- Верификация: [нужна / не нужна]\n"
+            "- Уровень наготы: [конкретно что разрешено]\n"
+            "- Тип контента: [что именно требуется]\n\n"
+            "❌ HARD BANS:\n"
+            "- [список что категорически нельзя]\n\n"
+            "✅ WHAT WORKS:\n"
+            "- [конкретные примеры контента который точно пройдёт]\n\n"
+            "Каждый блок отделяй строкой ━━━. Пиши чётко и конкретно.",
+            max_tokens=2500,
         )
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"Ошибка генерации: {e}")
@@ -955,11 +1111,8 @@ async def callback_weekly_subgroup(update: Update, context: ContextTypes.DEFAULT
 
     # Split by complete sub blocks — never break inside a block
     header = f"{group_name} — план на неделю {date_str}\n"
-    raw_blocks = [b.strip() for b in detail.split("━━━") if b.strip()]
-    # Reconstruct blocks with separator
-    blocks = [f"━━━ {b}" if not b.startswith("r/") else f"━━━ {b}" for b in raw_blocks]
 
-    # Simpler: split by the "━━━ r/" marker
+    # Split by the "━━━" marker, keeping each sub block intact
     sub_blocks: list[str] = []
     for block in detail.split("\n"):
         if block.startswith("━━━"):
@@ -975,7 +1128,7 @@ async def callback_weekly_subgroup(update: Update, context: ContextTypes.DEFAULT
 
     messages = split_by_blocks(header, final_blocks)
     for msg in messages:
-        await context.bot.send_message(chat_id=chat_id, text=msg)
+        await send_long_message(context.bot, chat_id, msg)
 
 
 # ─── Telegram command handlers ─────────────────────────────────────────────────
@@ -1000,7 +1153,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Загружаю топ-5 постов из r/cosplay...")
     try:
-        posts = fetch_reddit_posts("cosplay", limit=5)
+        posts = await asyncio.to_thread(fetch_reddit_posts, "cosplay", 5)
         if not posts:
             await update.message.reply_text("Посты не найдены. Проверьте API-ключ.")
             return
@@ -1027,7 +1180,7 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         has_posts = False
         for sub in subs:
             try:
-                posts = fetch_reddit_posts(sub, limit=3)
+                posts = await asyncio.to_thread(fetch_reddit_posts, sub, 3)
                 if not posts:
                     continue
                 lines.append(f"\nr/{sub}:")
@@ -1065,7 +1218,8 @@ async def cmd_findsubs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     seen: dict[str, dict] = {}
     for keyword in FINDSUBS_KEYWORDS:
         try:
-            for sub in filter_by_subscribers(search_subreddits_by_keyword(keyword)):
+            raw = await asyncio.to_thread(search_subreddits_by_keyword, keyword)
+            for sub in filter_by_subscribers(raw):
                 name = sub["display_name"].lower()
                 if name not in seen:
                     seen[name] = sub
@@ -1088,7 +1242,8 @@ async def cmd_findsubs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
     try:
-        answer = ask_openrouter(
+        answer = await asyncio.to_thread(
+            ask_openrouter,
             build_system_prompt("Ты Reddit-стратег для создателя контента для взрослых. Отвечай на русском."),
             f"Список сабреддитов:\n{subs_text}\n\n"
             "Выбери топ-10 самых релевантных для продвижения контента ЭТОГО конкретного создателя. "
@@ -1208,11 +1363,12 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     question = " ".join(context.args)
     await update.message.reply_text("Анализирую Reddit...")
     try:
-        posts = fetch_reddit_posts("cosplay", limit=10)
+        posts = await asyncio.to_thread(fetch_reddit_posts, "cosplay", 10)
         posts_text = "\n".join(
             f"- {p.get('title', '')} (score: {p.get('score', 0)})" for p in posts
         )
-        answer = ask_openrouter(
+        answer = await asyncio.to_thread(
+            ask_openrouter,
             build_system_prompt("Ты Reddit-аналитик для создателя контента для взрослых. Отвечай на русском."),
             f"Данные r/cosplay:\n{posts_text}\n\nВопрос: {question}",
         )
@@ -1225,7 +1381,6 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ─── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
-    import asyncio
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
