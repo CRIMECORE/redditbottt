@@ -37,3 +37,17 @@ CREATOR_PROFILE = {
 
     "open_to": "New niche fetishes and emerging trends if they drive traffic. Claude should think beyond obvious categories and find unexpected subreddit connections.",
 }
+
+# Competitors to track each week
+COMPETITORS = [
+    {
+        "username": "fallenemoangel3",
+        "notes": "брюнетка, грудь больше чем у нас, похожий стиль модной онлифанщицы",
+        "copy_style": False,   # стиль берём, прямой акцент на грудь — нет
+    },
+    {
+        "username": "llqpw",
+        "notes": "шатенка, очень похожа внешне, похожий стиль",
+        "copy_style": True,    # похожа — копируем максимально детально
+    },
+]

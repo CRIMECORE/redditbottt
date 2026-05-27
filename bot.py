@@ -26,7 +26,7 @@ from supabase import create_client, Client as SupabaseClient
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from subreddits import CATEGORIES, ALL_SUBS
-from profile import CREATOR_PROFILE
+from profile import CREATOR_PROFILE, COMPETITORS
 
 # Fix Windows console encoding for Cyrillic output
 if sys.platform == "win32":
@@ -555,6 +555,52 @@ def step0_find_subs_from_keywords(keywords: list[str]) -> list[str]:
     return sorted(seen.keys(), key=lambda n: seen[n], reverse=True)[:40]
 
 
+# ─── Competitor helpers ───────────────────────────────────────────────────────
+
+def fetch_competitor_posts(username: str, limit: int = 10) -> list[dict]:
+    """Fetch top posts of the week for a Reddit user via ScrapeCreators."""
+    url = f"{SCRAPECREATORS_BASE}/user"
+    headers = {"x-api-key": SCRAPECREATORS_API_KEY}
+    params = {"username": username, "type": "top", "t": "week", "limit": limit}
+    r = requests.get(url, headers=headers, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    posts = data.get("posts") or data.get("data") or []
+    return posts[:limit]
+
+
+def db_save_competitor_insight(
+    week_start: datetime.date,
+    username: str,
+    new_subreddits: list[str],
+    top_subreddits: list[str],
+    content_ideas: list[str],
+    priority_subs: list[str],
+    raw_analysis: str,
+) -> None:
+    try:
+        get_sb().table("competitor_insights").insert({
+            "week_start": week_start.isoformat(),
+            "competitor_username": username,
+            "new_subreddits": json.dumps(new_subreddits, ensure_ascii=False),
+            "top_subreddits": json.dumps(top_subreddits, ensure_ascii=False),
+            "content_ideas": json.dumps(content_ideas, ensure_ascii=False),
+            "priority_subs": json.dumps(priority_subs, ensure_ascii=False),
+            "raw_analysis": raw_analysis[:4000],
+        }).execute()
+        logger.info("Competitor insight saved for @%s", username)
+    except Exception as e:
+        logger.error("db_save_competitor_insight failed for @%s: %s", username, e)
+
+
+def db_check_competitor_table() -> bool:
+    try:
+        get_sb().table("competitor_insights").select("id").limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
 # ─── Google Sheets ────────────────────────────────────────────────────────────
 
 _SHEET_RANGE = urllib.parse.quote("'Reddit Stats — OF Analytics'!A:K")
@@ -819,6 +865,239 @@ async def send_long_message(bot, chat_id: int, text: str) -> None:
             await asyncio.sleep(0.5)
 
 
+# ─── Competitor analysis pipeline ────────────────────────────────────────────
+
+async def run_competitor_analysis(known_subs: set[str]) -> str:
+    """
+    Fetch top weekly posts for each competitor, run vision + 3-level Claude analysis.
+    Saves insights to Supabase. Returns formatted report string.
+    """
+    now = datetime.datetime.now(BANGKOK_TZ)
+    week_start = now.date() - datetime.timedelta(days=now.weekday())
+    known_lower = {s.lower() for s in known_subs}
+
+    # ── Fetch data for every competitor ──────────────────────────────────────
+    competitor_data: list[dict] = []
+    for comp in COMPETITORS:
+        username = comp["username"]
+        notes    = comp["notes"]
+        copy_ok  = comp.get("copy_style", True)
+        logger.info("Fetching competitor posts: @%s", username)
+
+        try:
+            posts = await asyncio.to_thread(fetch_competitor_posts, username, 10)
+        except Exception as e:
+            logger.warning("@%s fetch failed: %s", username, e)
+            posts = []
+
+        # Extract subreddits used by this competitor
+        used_subs: list[str] = list(dict.fromkeys(
+            p.get("subreddit") or p.get("subreddit_name_prefixed", "").lstrip("r/")
+            for p in posts
+            if p.get("subreddit") or p.get("subreddit_name_prefixed")
+        ))
+        new_subs = [s for s in used_subs if s.lower() not in known_lower]
+
+        # Best post this week
+        top_post = max(posts, key=lambda p: p.get("score") or p.get("ups") or 0) if posts else None
+
+        # Vision: download top-2 images
+        img_urls = extract_image_urls(posts[:6])
+        b64_images: list[str] = []
+        for url in img_urls[:2]:
+            b64 = await asyncio.to_thread(download_image_base64, url)
+            if b64:
+                b64_images.append(b64)
+
+        vision_text = ""
+        if b64_images:
+            try:
+                adapt_hint = (
+                    "Она очень похожа на нас внешне — анализируй максимально детально."
+                    if copy_ok else
+                    "У неё грудь больше — акцент на декольте НАМ не подходит, но стиль и ракурсы разбери."
+                )
+                vision_text = await asyncio.to_thread(
+                    ask_openrouter_vision,
+                    b64_images,
+                    f"Это посты конкурента @{username} на Reddit.\n{_compact_profile()}\n"
+                    f"Описание конкурента: {notes}. {adapt_hint}\n"
+                    "За 3-4 предложения: поза, свет, ракурс, стиль контента. "
+                    "Что именно можно воспроизвести с нашей внешностью?",
+                )
+            except Exception as e:
+                logger.warning("Vision failed for @%s: %s", username, e)
+                vision_text = "Визуал недоступен."
+
+        competitor_data.append({
+            "username": username,
+            "notes": notes,
+            "copy_style": copy_ok,
+            "posts": posts,
+            "used_subs": used_subs,
+            "new_subs": new_subs,
+            "top_post": top_post,
+            "vision": vision_text,
+        })
+
+    if not competitor_data:
+        return "📊 КОНКУРЕНТНЫЙ АНАЛИЗ\n\nДанные недоступны."
+
+    # ── Build Claude prompt ───────────────────────────────────────────────────
+    comp_ctx_parts: list[str] = []
+    for cd in competitor_data:
+        top_posts_lines = "\n".join(
+            f"  [{p.get('score') or p.get('ups', 0)} апв] r/{p.get('subreddit','?')}: "
+            f"{p.get('title','')[:80]}"
+            for p in sorted(cd["posts"],
+                            key=lambda p: p.get("score") or p.get("ups") or 0,
+                            reverse=True)[:5]
+        ) or "  нет данных"
+
+        comp_ctx_parts.append(
+            f"КОНКУРЕНТ: @{cd['username']}\n"
+            f"Описание: {cd['notes']}\n"
+            f"copy_style={cd['copy_style']} (True = копируем детально, False = берём только стиль/сабы)\n"
+            f"Сабреддиты конкурента: {', '.join(cd['used_subs'][:12]) or 'нет данных'}\n"
+            f"Новые сабы (нет в нашем пуле): {', '.join(cd['new_subs']) or 'нет новых'}\n"
+            f"Топ постов недели:\n{top_posts_lines}\n"
+            f"Визуальный анализ: {cd['vision'][:400] if cd['vision'] else 'нет'}"
+        )
+
+    try:
+        raw_analysis = await asyncio.to_thread(
+            ask_openrouter,
+            build_system_prompt(
+                "Ты эксперт по конкурентному анализу OnlyFans/Reddit. "
+                "Пиши на русском, структурированно и actionable."
+            ),
+            f"ДАННЫЕ КОНКУРЕНТОВ:\n\n" + "\n\n---\n\n".join(comp_ctx_parts) + "\n\n"
+            "Составь трёхуровневый анализ СТРОГО в этом формате:\n\n"
+            "LEVEL1_START\n"
+            "## Прямые инсайты (копируем прямо сейчас)\n"
+            "- Топ посты и апвоуты\n"
+            "- Активные сабреддиты где они сейчас\n"
+            "- Подписи/стиль подачи которые работают\n"
+            "- Лучшее время постинга (если видно)\n"
+            "LEVEL1_END\n\n"
+            "LEVEL2_START\n"
+            "## Стратегические выводы\n"
+            "- Новые сабреддиты конкурентов которые нам стоит попробовать\n"
+            "- Новые темы/ниши которые они осваивают\n"
+            "- Где резкий рост апвоутов — горячая аудитория\n"
+            "- Что адаптировать под нашу внешность (учитывай copy_style каждого конкурента)\n"
+            "LEVEL2_END\n\n"
+            "LEVEL3_START\n"
+            "NEW_SUBS: sub1,sub2,sub3\n"
+            "NICHES: ниша1; ниша2; ниша3\n"
+            "IDEAS: идея1; идея2; идея3\n"
+            "PRIORITY_SUBS: сабы где конкуренты набирают 500+ апвоутов\n"
+            "LEVEL3_END",
+            max_tokens=1800,
+        )
+    except Exception as e:
+        logger.error("Competitor Claude analysis failed: %s", e)
+        raw_analysis = ""
+
+    # ── Parse Level 3 ─────────────────────────────────────────────────────────
+    new_subs_db: list[str] = []
+    niches_db:   list[str] = []
+    ideas_db:    list[str] = []
+    priority_db: list[str] = []
+
+    in_l3 = False
+    for line in raw_analysis.splitlines():
+        s = line.strip()
+        if "LEVEL3_START" in s:
+            in_l3 = True; continue
+        if "LEVEL3_END"  in s:
+            in_l3 = False; continue
+        if not in_l3:
+            continue
+        up = s.upper()
+        if up.startswith("NEW_SUBS:"):
+            new_subs_db   = [x.strip() for x in s.split(":",1)[1].split(",") if x.strip()]
+        elif up.startswith("NICHES:"):
+            niches_db     = [x.strip() for x in s.split(":",1)[1].split(";") if x.strip()]
+        elif up.startswith("IDEAS:"):
+            ideas_db      = [x.strip() for x in s.split(":",1)[1].split(";") if x.strip()]
+        elif up.startswith("PRIORITY_SUBS:"):
+            priority_db   = [x.strip() for x in s.split(":",1)[1].split(",") if x.strip()]
+
+    # ── Save to Supabase ──────────────────────────────────────────────────────
+    for cd in competitor_data:
+        db_save_competitor_insight(
+            week_start     = week_start,
+            username       = cd["username"],
+            new_subreddits = cd["new_subs"],
+            top_subreddits = cd["used_subs"],
+            content_ideas  = ideas_db,
+            priority_subs  = priority_db,
+            raw_analysis   = raw_analysis,
+        )
+
+    # ── Format Telegram message ───────────────────────────────────────────────
+    out: list[str] = ["📊 КОНКУРЕНТНЫЙ АНАЛИЗ\n"]
+
+    for cd in competitor_data:
+        tp = cd["top_post"]
+        top_title = (tp.get("title") or "—")[:60]   if tp else "—"
+        top_score = (tp.get("score") or tp.get("ups") or 0) if tp else 0
+        top_sub   = (tp.get("subreddit") or "?")     if tp else "?"
+        copy_mark = "✅ Похожа на нас — копируем детально" if cd["copy_style"] else "⚠️ Копируем стиль, не анатомию"
+
+        out.append(f"━━━ @{cd['username']} ━━━")
+        out.append(f"🔥 Топ пост: {top_title} — {top_score} апв (r/{top_sub})")
+        out.append(f"📍 Активные сабы: {', '.join(cd['used_subs'][:7]) or 'нет данных'}")
+        if cd["new_subs"]:
+            out.append(f"🆕 Новые для нас: {', '.join(cd['new_subs'][:6])}")
+        out.append(f"👁️ Визуал: {cd['vision'][:220] if cd['vision'] else '—'}")
+        out.append(f"{copy_mark}\n")
+
+    # Extract Level 1 and Level 2 blocks from Claude output
+    l1_lines: list[str] = []
+    l2_lines: list[str] = []
+    in_l1 = in_l2 = False
+    for line in raw_analysis.splitlines():
+        s = line.strip()
+        if "LEVEL1_START" in s: in_l1 = True;  continue
+        if "LEVEL1_END"  in s: in_l1 = False; continue
+        if "LEVEL2_START" in s: in_l2 = True;  continue
+        if "LEVEL2_END"  in s: in_l2 = False; continue
+        if in_l1 and s: l1_lines.append(s)
+        if in_l2 and s: l2_lines.append(s)
+
+    if l1_lines:
+        out.append("📌 ПРЯМЫЕ ИНСАЙТЫ (копируем сейчас):")
+        out.extend(l1_lines[:15])
+        out.append("")
+
+    if l2_lines:
+        out.append("💡 СТРАТЕГИЧЕСКИЕ ВЫВОДЫ:")
+        out.extend(l2_lines[:15])
+        out.append("")
+
+    # All new subs discovered across competitors
+    all_new = list(dict.fromkeys(s for cd in competitor_data for s in cd["new_subs"]))
+    if all_new:
+        out.append("🎯 НОВЫЕ САБРЕДДИТЫ от конкурентов (добавить в пул):")
+        out.append(", ".join(f"r/{s}" for s in all_new[:12]))
+        out.append("")
+
+    if niches_db:
+        out.append("💡 НОВЫЕ НАПРАВЛЕНИЯ для нас:")
+        out.extend(f"• {n}" for n in niches_db[:6])
+        out.append("")
+
+    out.append(
+        f"🧠 СОХРАНЕНО В БАЗУ: "
+        f"{len(new_subs_db)} новых сабов, {len(niches_db)} ниш, "
+        f"{len(ideas_db)} идей, {len(priority_db)} приоритетных сабов"
+    )
+
+    return "\n".join(out)
+
+
 # ─── Daily plan pipeline ───────────────────────────────────────────────────────
 
 async def run_weekly_plan(app) -> None:
@@ -1022,7 +1301,24 @@ async def run_weekly_plan(app) -> None:
         except Exception as e:
             logger.error("Failed sending weekly plan to %s: %s", cid, e)
 
-    await broadcast(f"Готово. {token_summary()}")
+    await broadcast(f"План готов. {token_summary()}")
+
+    # ── Step 6: competitor analysis ───────────────────────────────────────────
+    await broadcast("🔍 Анализирую конкурентов...")
+    known_sub_names: set[str] = set(combined_pool)
+    try:
+        competitor_report = await run_competitor_analysis(known_sub_names)
+    except Exception as e:
+        logger.error("Competitor analysis failed: %s", e)
+        competitor_report = "📊 Конкурентный анализ: не удалось выполнить."
+
+    for cid in chat_ids:
+        try:
+            await send_long_message(app.bot, cid, competitor_report)
+        except Exception as e:
+            logger.error("Failed sending competitor report to %s: %s", cid, e)
+
+    await broadcast(f"Всё готово. Итого: {token_summary()}")
 
 
 # ─── Subgroup detail callback ──────────────────────────────────────────────────
@@ -1167,9 +1463,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/digest — дайджест топ-3 постов по всем категориям\n"
         "/findsubs — найти новые сабреддиты (10k+ подписчиков)\n"
         "/plan — еженедельный план прямо сейчас\n"
+        "/competitors — конкурентный анализ прямо сейчас\n"
         "/weekly — аналитика за неделю (из Google Sheets)\n"
         "/ask [вопрос] — вопрос по Reddit-данным\n\n"
-        "Авто: план по понедельникам в 09:00, аналитика по воскресеньям в 20:00 Bangkok."
+        "Авто: план + конкурентный анализ по понедельникам в 09:00, "
+        "аналитика по воскресеньям в 20:00 Bangkok."
     )
     await update.message.reply_text(text)
 
@@ -1282,6 +1580,22 @@ async def cmd_findsubs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             for s in subs_list[:10]
         )
         await update.message.reply_text(f"Claude недоступен. Топ-10 по подписчикам:\n\n{fallback}")
+
+
+async def cmd_competitors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manual trigger: run competitor analysis right now."""
+    save_chat_id(update.effective_chat.id)
+    await update.message.reply_text(
+        f"🔍 Анализирую {len(COMPETITORS)} конкурентов...\n"
+        "Это займёт ~1 минуту."
+    )
+    try:
+        known = set(ALL_SUBS) | set(await asyncio.to_thread(db_get_active_sub_names))
+        report = await run_competitor_analysis(known)
+        await send_long_message(context.bot, update.effective_chat.id, report)
+    except Exception as e:
+        logger.exception("Error in /competitors")
+        await update.message.reply_text(f"Ошибка: {e}")
 
 
 async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1414,14 +1728,15 @@ def main() -> None:
     logger.info("SHEET_ID: %s", SHEET_ID or "НЕ ЗАДАН")
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("test", cmd_test))
-    app.add_handler(CommandHandler("digest", cmd_digest))
-    app.add_handler(CommandHandler("findsubs", cmd_findsubs))
-    app.add_handler(CommandHandler("plan", cmd_plan))
-    app.add_handler(CommandHandler("weekly", cmd_weekly))
-    app.add_handler(CommandHandler("ask", cmd_ask))
+    app.add_handler(CommandHandler("start",       cmd_start))
+    app.add_handler(CommandHandler("ping",        cmd_ping))
+    app.add_handler(CommandHandler("test",        cmd_test))
+    app.add_handler(CommandHandler("digest",      cmd_digest))
+    app.add_handler(CommandHandler("findsubs",    cmd_findsubs))
+    app.add_handler(CommandHandler("plan",        cmd_plan))
+    app.add_handler(CommandHandler("weekly",      cmd_weekly))
+    app.add_handler(CommandHandler("ask",         cmd_ask))
+    app.add_handler(CommandHandler("competitors", cmd_competitors))
     app.add_handler(CallbackQueryHandler(callback_analyze_weekly,  pattern=f"^{CALLBACK_WEEKLY}$"))
     app.add_handler(CallbackQueryHandler(callback_weekly_subgroup, pattern=f"^{CALLBACK_SUBGROUP}_\\d+$"))
 
@@ -1444,6 +1759,25 @@ def main() -> None:
             ");\n"
             "ALTER TABLE public.subreddits ENABLE ROW LEVEL SECURITY;\n"
             "CREATE POLICY allow_all ON public.subreddits FOR ALL TO anon USING (true) WITH CHECK (true);\n"
+        )
+
+    if not db_check_competitor_table():
+        logger.warning(
+            "Supabase table 'competitor_insights' not found. "
+            "Run this SQL in the Supabase dashboard:\n\n"
+            "CREATE TABLE public.competitor_insights (\n"
+            "  id BIGSERIAL PRIMARY KEY,\n"
+            "  week_start DATE NOT NULL,\n"
+            "  competitor_username TEXT NOT NULL,\n"
+            "  new_subreddits JSONB DEFAULT '[]',\n"
+            "  top_subreddits JSONB DEFAULT '[]',\n"
+            "  content_ideas JSONB DEFAULT '[]',\n"
+            "  priority_subs JSONB DEFAULT '[]',\n"
+            "  raw_analysis TEXT,\n"
+            "  created_at TIMESTAMPTZ DEFAULT NOW()\n"
+            ");\n"
+            "ALTER TABLE public.competitor_insights ENABLE ROW LEVEL SECURITY;\n"
+            "CREATE POLICY allow_all ON public.competitor_insights FOR ALL TO anon USING (true) WITH CHECK (true);\n"
         )
 
     scheduler = AsyncIOScheduler(timezone=BANGKOK_TZ)
