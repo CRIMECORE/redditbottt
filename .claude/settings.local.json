@@ -13,7 +13,14 @@
       "PowerShell(Remove-Item *)",
       "Bash(Get-Content \"C:\\\\Users\\\\CRIMEC~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-CRIMECORE-RedditBot\\\\71d44a48-0295-45d1-bb07-eaa22b76e4f6\\\\tasks\\\\bmtdgtkkg.output\" -Wait -Tail 50)",
       "Bash(pkill -f \"python bot.py\")",
-      "PowerShell(Start-Process python -ArgumentList \"bot.py\" -WorkingDirectory \"C:\\\\Users\\\\CRIMECORE\\\\RedditBot\" -WindowStyle Hidden; Write-Output \"Bot started\")"
+      "PowerShell(Start-Process python -ArgumentList \"bot.py\" -WorkingDirectory \"C:\\\\Users\\\\CRIMECORE\\\\RedditBot\" -WindowStyle Hidden; Write-Output \"Bot started\")",
+      "WebFetch(domain:app.scrapecreators.com)",
+      "WebSearch",
+      "WebFetch(domain:docs.scrapecreators.com)",
+      "WebFetch(domain:scrapecreators.com)",
+      "Bash(pip install *)",
+      "Bash(taskkill /F /FI \"WINDOWTITLE eq *bot.py*\" /T)",
+      "Bash(taskkill /F /FI \"IMAGENAME eq python.exe\" /T)"
     ]
   }
 }

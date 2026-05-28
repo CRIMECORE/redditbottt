@@ -7,3 +7,4 @@ gspread
 google-auth
 python-telegram-bot
 duckduckgo-search
+fpdf2
