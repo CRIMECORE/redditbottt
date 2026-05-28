@@ -20,7 +20,13 @@
       "WebFetch(domain:scrapecreators.com)",
       "Bash(pip install *)",
       "Bash(taskkill /F /FI \"WINDOWTITLE eq *bot.py*\" /T)",
-      "Bash(taskkill /F /FI \"IMAGENAME eq python.exe\" /T)"
+      "Bash(taskkill /F /FI \"IMAGENAME eq python.exe\" /T)",
+      "PowerShell(python -c \"import fpdf; import os; print\\(os.path.dirname\\(fpdf.__file__\\)\\)\")",
+      "PowerShell(Invoke-WebRequest -Uri \"https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/master/fonts/DejaVuSans.ttf\" -OutFile \"C:\\\\Users\\\\CRIMECORE\\\\Bots\\\\RedditBot\\\\fonts\\\\DejaVuSans.ttf\" -UseBasicParsing)",
+      "PowerShell(Expand-Archive *)",
+      "Bash(Get-Content \"C:\\\\Users\\\\CRIMEC~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-CRIMECORE-Bots-RedditBot\\\\546f2d11-4a6f-4ade-b450-150d74e4beb3\\\\tasks\\\\b9ijmxd6b.output\" -Wait)",
+      "PowerShell(Get-Content \"C:\\\\Users\\\\CRIMECORE\\\\Bots\\\\RedditBot\\\\daily_cache.json\" | python -c \"import sys,json; d=json.load\\(sys.stdin\\); [print\\(k, list\\(v.keys\\(\\)\\)\\) for k,v in d.items\\(\\)]\")",
+      "PowerShell(Get-Content \"C:\\\\Users\\\\CRIMEC~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-CRIMECORE-Bots-RedditBot\\\\546f2d11-4a6f-4ade-b450-150d74e4beb3\\\\tasks\\\\b43uyyxuh.output\" | Where-Object { $_ -match \"ERROR|WARNING|Traceback|Exception|handler|command|callback\" })"
     ]
   }
 }

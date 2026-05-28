@@ -62,7 +62,23 @@ CALLBACK_DAILY_HOT     = "daily_hot"
 CALLBACK_DAILY_GOOD    = "daily_good"
 CALLBACK_DAILY_NEUTRAL = "daily_neutral"
 
-_daily_cache: dict[int, dict] = {}
+_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "daily_cache.json")
+
+def _load_cache() -> dict[int, dict]:
+    try:
+        with open(_CACHE_FILE, encoding="utf-8") as f:
+            return {int(k): v for k, v in json.load(f).items()}
+    except Exception:
+        return {}
+
+def _save_cache(cache: dict[int, dict]) -> None:
+    try:
+        with open(_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in cache.items()}, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning("Failed to save daily cache: %s", e)
+
+_daily_cache: dict[int, dict] = _load_cache()
 
 # Reverse map: subreddit_name_lower -> category name
 _SUB_CATEGORY: dict[str, str] = {
@@ -863,7 +879,6 @@ async def run_daily_plan(app) -> None:
     for sub in all_subs_ordered:
         info = sub_info.get(sub, {})
         subs_count = info.get("subscribers", 0)
-        online     = info.get("online", 0)
         # best post score in this sub today
         best = 0
         for gd in girls_data:
@@ -872,7 +887,7 @@ async def run_daily_plan(app) -> None:
                 if ps == sub:
                     best = max(best, p.get("score") or p.get("ups") or 0)
         sub_info_lines.append(
-            f"r/{sub}: {subs_count:,} подписчиков, {online:,} онлайн сейчас, лучший пост сегодня: {best} апв"
+            f"r/{sub}: {subs_count:,} подписчиков, лучший пост сегодня: {best} апв"
         )
 
     hot_subs: list[str]     = []
@@ -891,9 +906,9 @@ async def run_daily_plan(app) -> None:
             f"У девочек залетело (200+ апвоутов или быстрый набор) в: {', '.join(flying_subs.keys()) or 'нет'}\n\n"
             "Раздели ВСЕ сабреддиты на 3 категории по перспективности для постинга СЕГОДНЯ.\n"
             "Критерии:\n"
-            "ГОРЯЧИЕ — залетело у девочек (200+ апв) И/ИЛИ много онлайн сейчас (500+) И большая аудитория\n"
+            "ГОРЯЧИЕ — залетело у девочек (200+ апв) И/ИЛИ большая аудитория\n"
             "ХОРОШИЕ — средняя аудитория или умеренные результаты у девочек\n"
-            "НЕЙТРАЛЬНЫЕ — мало трафика, мало онлайн, слабые результаты\n\n"
+            "НЕЙТРАЛЬНЫЕ — мало трафика, слабые результаты\n\n"
             "Формат СТРОГО (только эти 3 строки, включи ВСЕ сабреддиты):\n"
             "ГОРЯЧИЕ: sub1,sub2,sub3\n"
             "ХОРОШИЕ: sub1,sub2\n"
@@ -928,10 +943,9 @@ async def run_daily_plan(app) -> None:
     def _sub_line_full(s: str) -> str:
         info = sub_info.get(s, {})
         subs = info.get("subscribers", 0)
-        onl  = info.get("online", 0)
         score = flying_set.get(s)
         flew  = f"  📈 залетело ({_fmt_score(score)})" if score is not None else ""
-        return f"r/{s}  ({subs:,} подп. | {onl:,} онлайн){flew}"
+        return f"r/{s}  ({subs:,} подп.){flew}"
 
     if hot_subs:
         lines.append("🔥 ГОРЯЧИЕ РЕДДИТЫ:")
@@ -962,14 +976,15 @@ async def run_daily_plan(app) -> None:
             if len(_daily_cache) > 50:
                 del _daily_cache[next(iter(_daily_cache))]
             _daily_cache[cid] = {
-                "hot":             hot_subs,
-                "good":            good_subs,
-                "neutral":         neutral_subs,
-                "flying":          dict(flying_subs),
-                "sub_info": sub_info,
+                "hot":        hot_subs,
+                "good":       good_subs,
+                "neutral":    neutral_subs,
+                "flying":     dict(flying_subs),
+                "sub_info":   sub_info,
                 "girls_data": [{"username": gd["username"], "used_subs": gd["used_subs"]} for gd in girls_data],
-                "date_str":        date_str,
+                "date_str":   date_str,
             }
+            _save_cache(_daily_cache)
         except Exception as e:
             logger.error("Failed sending daily plan to %s: %s", cid, e)
 
@@ -1055,81 +1070,109 @@ async def _analyze_subs_for_pdf(subs_raw: list[dict]) -> list[dict]:
     return results
 
 
+def _wrap_long_words(text: str, max_len: int = 40) -> str:
+    """Insert spaces into words longer than max_len so fpdf2 can wrap them."""
+    result = []
+    for word in text.split():
+        while len(word) > max_len:
+            result.append(word[:max_len])
+            word = word[max_len:]
+        result.append(word)
+    return " ".join(result)
+
+
 def _build_pdf(subs_analyzed: list[dict], category: str, date_str: str, token_info: dict | None = None) -> str:
     """Generate PDF and return temp file path."""
     import tempfile
     from fpdf import FPDF
 
-    pdf = FPDF()
-    pdf.set_margins(15, 15, 15)
-    pdf.set_auto_page_break(auto=True, margin=15)
+    # A5 portrait — narrower than A4, fits phone screens much better
+    pdf = FPDF(orientation="P", unit="mm", format="A5")
+    pdf.set_margins(12, 12, 12)
+    pdf.set_auto_page_break(auto=True, margin=12)
 
-    font_reg  = r"C:\Windows\Fonts\arial.ttf"
-    font_bold = r"C:\Windows\Fonts\arialbd.ttf"
-    if os.path.exists(font_reg):
-        pdf.add_font("f", "",  font_reg)
-        pdf.add_font("f", "B", font_bold if os.path.exists(font_bold) else font_reg)
-    else:
-        fallback = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-        pdf.add_font("f", "", fallback)
-        pdf.add_font("f", "B", fallback)
+    _base = os.path.dirname(os.path.abspath(__file__))
+    _candidates_reg = [
+        os.path.join(_base, "fonts", "DejaVuSans.ttf"),
+        os.path.join(_base, "fonts", "arial.ttf"),
+        r"C:\Windows\Fonts\arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ]
+    _candidates_bold = [
+        os.path.join(_base, "fonts", "DejaVuSans-Bold.ttf"),
+        os.path.join(_base, "fonts", "arialbd.ttf"),
+        r"C:\Windows\Fonts\arialbd.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ]
+    font_reg  = next((p for p in _candidates_reg  if os.path.exists(p)), None)
+    font_bold = next((p for p in _candidates_bold if os.path.exists(p)), None)
+    if font_reg is None:
+        raise FileNotFoundError(
+            "Не найден TTF-шрифт для PDF. Убедитесь что папка fonts/ есть рядом с bot.py"
+        )
+    pdf.add_font("f", "",  font_reg)
+    pdf.add_font("f", "B", font_bold or font_reg)
+
+    lh = 7  # line height
+
+    def section(label: str, text: str) -> None:
+        clean = _wrap_long_words((text or "—").strip())
+        pdf.set_x(pdf.l_margin)
+        pdf.set_font("f", "B", 12)
+        pdf.multi_cell(pdf.epw, lh, label, align="L", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_x(pdf.l_margin)
+        pdf.set_font("f", "", 11)
+        pdf.multi_cell(pdf.epw, lh, clean, align="L", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(4)
 
     # ── Title page ────────────────────────────────────────────────────────
     pdf.add_page()
-    w = pdf.epw
-    pdf.set_font("f", "B", 22)
-    pdf.multi_cell(w, 13, f"Реддиты: {category}", align="L")
+    pdf.set_x(pdf.l_margin)
+    pdf.set_font("f", "B", 18)
+    pdf.multi_cell(pdf.epw, 11, f"Реддиты: {category}", align="L", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(2)
-    pdf.set_font("f", "", 13)
-    pdf.multi_cell(w, 9, f"Дата: {date_str}")
-    pdf.multi_cell(w, 9, f"Сабреддитов: {len(subs_analyzed)}")
+    pdf.set_font("f", "", 12)
+    pdf.set_x(pdf.l_margin)
+    pdf.multi_cell(pdf.epw, 8, f"Дата: {date_str}", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_x(pdf.l_margin)
+    pdf.multi_cell(pdf.epw, 8, f"Сабреддитов: {len(subs_analyzed)}", new_x="LMARGIN", new_y="NEXT")
 
     # ── One sub per page ──────────────────────────────────────────────────
     for sub in subs_analyzed:
         pdf.add_page()
-        w = pdf.epw
 
-        pdf.set_font("f", "B", 18)
-        pdf.multi_cell(w, 12, f"r/{sub.get('name', '?')}", align="L")
+        pdf.set_x(pdf.l_margin)
+        pdf.set_font("f", "B", 15)
+        pdf.multi_cell(pdf.epw, 10, f"r/{sub.get('name', '?')}", align="L", new_x="LMARGIN", new_y="NEXT")
         pdf.ln(3)
 
-        sections = [
-            ("Верификация",    sub.get("verification", "—")),
-            ("Уровень наготы", sub.get("nudity",        "—")),
-            ("Тип контента",   sub.get("content_type",  "—")),
-            ("Правила (рус.)", sub.get("rules_ru",      "—")),
-        ]
-        for title, content in sections:
-            pdf.set_font("f", "B", 12)
-            pdf.multi_cell(w, 8, f"{title}:")
-            pdf.set_font("f", "", 11)
-            pdf.multi_cell(w, 7, (content or "—").strip())
-            pdf.ln(4)
+        section("Верификация",    sub.get("verification", "—"))
+        section("Уровень наготы", sub.get("nudity",        "—"))
+        section("Тип контента",   sub.get("content_type",  "—"))
+        section("Правила (рус.)", sub.get("rules_ru",      "—"))
 
     # ── Token / cost page ─────────────────────────────────────────────────
     if token_info:
         pdf.add_page()
-        w = pdf.epw
-        pdf.set_font("f", "B", 16)
-        pdf.multi_cell(w, 11, "Расход токенов (этот PDF)")
-        pdf.ln(4)
-        pdf.set_font("f", "", 12)
+        pdf.set_font("f", "B", 18)
+        pdf.multi_cell(pdf.epw, 12, "Расход токенов (этот PDF)")
+        pdf.ln(5)
         t_in  = token_info.get("in",   0)
         t_out = token_info.get("out",  0)
         cost  = token_info.get("cost", 0.0)
-        model = "Claude Sonnet 4.6 (OpenRouter)"
         rows = [
-            ("Модель",           model),
+            ("Модель",           "Claude Sonnet 4.6 (OpenRouter)"),
             ("Входящие токены",  f"{t_in:,}"),
             ("Исходящие токены", f"{t_out:,}"),
             ("Всего токенов",    f"{t_in + t_out:,}"),
             ("Стоимость",        f"${cost:.4f}"),
         ]
         for label, value in rows:
-            pdf.set_font("f", "B", 12)
-            pdf.cell(60, 9, f"{label}:", new_x="RIGHT", new_y="TOP")
-            pdf.set_font("f", "", 12)
-            pdf.multi_cell(w - 60, 9, value)
+            section(label, value)
 
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     pdf.output(tmp.name)
