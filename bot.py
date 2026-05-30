@@ -6,6 +6,7 @@ import base64
 import logging
 import urllib.parse
 import datetime
+import xml.etree.ElementTree as ET
 import requests
 from pathlib import Path
 from dotenv import load_dotenv
@@ -44,11 +45,14 @@ if _missing:
 
 SCRAPECREATORS_BASE = "https://api.scrapecreators.com/v1/reddit"
 OPENROUTER_BASE     = "https://openrouter.ai/api/v1/chat/completions"
-REDDIT_HEADERS      = {"User-Agent": "SubFinderBot/1.0"}
+REDDIT_HEADERS      = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
 FINDSUBS_KEYWORDS   = ["cosplay", "anime", "fetish", "gamer girl", "latex", "alternative", "goth", "NSFW"]
 
 BANNED_SUBS = frozenset({"ResidentEvil", "DunderMifflin"})
 BANNED_MODS = frozenset({"louise mania", "mad dickson", "pessimist", "rick spanish"})
+
+# Subreddits targeting specific hair/looks we don't match — filter by name keyword
+EXCLUDE_KEYWORDS = frozenset({"ginger", "redhead", "auburn", "brunette", "blonde_only"})
 DRAWN_CONTENT_SUBS = frozenset({
     "AnimeArt", "hentai", "animeart", "GoneWildAnime", "AnimeGirlsNSFW",
     "anime", "AnimeGirls", "HentaiAi", "rule34", "rule34ai", "hentai_gif",
@@ -61,8 +65,11 @@ DAILY_TRACKED_GIRLS = ["fallenemoangel3", "llqpw", "BarelyVisibleTaboo"]
 CALLBACK_DAILY_HOT     = "daily_hot"
 CALLBACK_DAILY_GOOD    = "daily_good"
 CALLBACK_DAILY_NEUTRAL = "daily_neutral"
+CALLBACK_DAILY_READY   = "daily_ready"
 
-_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "daily_cache.json")
+_CACHE_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "daily_cache.json")
+_SUB_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sub_cache.json")
+_SUB_CACHE_TTL  = 43200  # 12 hours — subreddit details don't change that fast
 
 def _load_cache() -> dict[int, dict]:
     try:
@@ -79,6 +86,22 @@ def _save_cache(cache: dict[int, dict]) -> None:
         logger.warning("Failed to save daily cache: %s", e)
 
 _daily_cache: dict[int, dict] = _load_cache()
+
+def _load_sub_cache() -> dict[str, dict]:
+    try:
+        with open(_SUB_CACHE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_sub_cache() -> None:
+    try:
+        with open(_SUB_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_sub_details_cache, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning("Failed to save sub cache: %s", e)
+
+_sub_details_cache: dict[str, dict] = _load_sub_cache()
 
 # Reverse map: subreddit_name_lower -> category name
 _SUB_CATEGORY: dict[str, str] = {
@@ -270,25 +293,21 @@ def fetch_top_posts_week(subreddit: str, limit: int = 10) -> list[dict]:
 
 
 def fetch_subreddit_rules(subreddit: str) -> str:
-    try:
-        r = requests.get(
-            f"https://www.reddit.com/r/{subreddit}/about/rules.json",
-            headers=REDDIT_HEADERS, timeout=10,
-        )
-        rules = r.json().get("rules", [])
-        if not rules:
-            return "No rules found"
-        parts = []
-        for i, rule in enumerate(rules, 1):
-            name = rule.get("short_name", "").strip()
-            desc = (rule.get("description") or "").strip()[:300]
-            line = f"Rule #{i}: {name}"
-            if desc:
-                line += f" — {desc}"
-            parts.append(line)
-        return "\n".join(parts)
-    except Exception:
+    """Return rules + description from cache (populated by fetch_subreddit_info)."""
+    key    = subreddit.lower()
+    now    = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    cached = _sub_details_cache.get(key)
+    if not cached or (now - cached.get("_ts", 0)) >= _SUB_CACHE_TTL:
+        fetch_subreddit_info(subreddit)
+        cached = _sub_details_cache.get(key)
+    if not cached:
         return "Rules unavailable"
+    rules = cached.get("rules", "").strip()
+    desc  = cached.get("description", "").strip()[:500]
+    parts = []
+    if rules: parts.append(rules)
+    if desc:  parts.append(f"Описание: {desc}")
+    return "\n\n".join(parts) if parts else "No rules found"
 
 
 def fetch_subreddit_mods(subreddit: str) -> list[str]:
@@ -304,17 +323,31 @@ def fetch_subreddit_mods(subreddit: str) -> list[str]:
 
 
 def fetch_subreddit_info(subreddit: str) -> dict:
-    """Return subscribers and active_user_count (online now) for a subreddit."""
+    """Return subreddit details via ScrapeCreators with 12h persistent cache."""
+    key    = subreddit.lower()
+    now    = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    cached = _sub_details_cache.get(key)
+    if cached and (now - cached.get("_ts", 0)) < _SUB_CACHE_TTL:
+        return {"subscribers": cached.get("subscribers", 0), "online": cached.get("online", 0)}
     try:
-        r    = requests.get(
-            f"https://www.reddit.com/r/{subreddit}/about.json",
-            headers=REDDIT_HEADERS, timeout=10,
+        r = requests.get(
+            f"{SCRAPECREATORS_BASE}/subreddit/details",
+            headers={"x-api-key": SCRAPECREATORS_API_KEY},
+            params={"subreddit": subreddit},
+            timeout=10,
         )
-        data = r.json().get("data", {})
-        return {
-            "subscribers":  data.get("subscribers")       or 0,
-            "online":       data.get("active_user_count") or 0,
+        r.raise_for_status()
+        data  = r.json()
+        entry = {
+            "subscribers": data.get("weekly_active_users") or 0,
+            "online":      data.get("weekly_contributions") or 0,
+            "rules":       (data.get("rules") or "").strip(),
+            "description": (data.get("description") or "").strip(),
+            "_ts":         now,
         }
+        _sub_details_cache[key] = entry
+        _save_sub_cache()
+        return {"subscribers": entry["subscribers"], "online": entry["online"]}
     except Exception:
         return {"subscribers": 0, "online": 0}
 
@@ -432,30 +465,92 @@ def ask_openrouter_vision(images_b64: list[str], text_prompt: str) -> str:
 # ─── Competitor helpers ───────────────────────────────────────────────────────
 
 def fetch_competitor_posts(username: str, limit: int = 10) -> list[dict]:
-    r = requests.get(
-        f"https://www.reddit.com/user/{username}/submitted.json",
-        headers=REDDIT_HEADERS,
-        params={"sort": "top", "t": "week", "limit": limit},
-        timeout=15,
-    )
-    r.raise_for_status()
-    children = r.json().get("data", {}).get("children", [])
-    return [c["data"] for c in children[:limit] if c.get("data")]
+    """Fetch recent posts by a competitor via RSS (Reddit JSON API returns 403)."""
+    _NS    = "http://www.w3.org/2005/Atom"
+    try:
+        r = requests.get(
+            f"https://www.reddit.com/user/{username}/submitted/.rss",
+            headers=REDDIT_HEADERS,
+            params={"sort": "new", "limit": limit},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            logger.warning("fetch_competitor_posts @%s HTTP %d", username, r.status_code)
+            return []
+        root  = ET.fromstring(r.content)
+        posts = []
+        for e in root.findall(f"{{{_NS}}}entry")[:limit]:
+            cat   = e.find(f"{{{_NS}}}category")
+            sub   = (cat.get("term") if cat is not None else None) or ""
+            link  = e.find(f"{{{_NS}}}link")
+            url   = (link.get("href") if link is not None else "") or ""
+            title = e.findtext(f"{{{_NS}}}title") or ""
+            pub   = e.findtext(f"{{{_NS}}}published") or ""
+            try:
+                ts = datetime.datetime.fromisoformat(pub.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                ts = 0
+            posts.append({"subreddit": sub, "title": title, "url": url,
+                          "created_utc": ts, "score": 0, "ups": 0})
+        return posts
+    except Exception as e:
+        logger.warning("fetch_competitor_posts @%s failed: %s", username, e)
+        return []
 
 
 def fetch_user_posts_24h(username: str, limit: int = 25) -> list[dict]:
-    """Fetch recent posts by a Reddit user, filtered to last 24 hours."""
-    r = requests.get(
-        f"https://www.reddit.com/user/{username}/submitted.json",
-        headers=REDDIT_HEADERS,
-        params={"sort": "new", "limit": limit},
-        timeout=15,
-    )
-    r.raise_for_status()
-    children = r.json().get("data", {}).get("children", [])
-    posts    = [c["data"] for c in children if c.get("data")]
-    cutoff   = datetime.datetime.utcnow().timestamp() - 86400
-    return [p for p in posts if (p.get("created_utc") or 0) >= cutoff]
+    """Fetch recent posts by a Reddit user via RSS, filtered to last 24 hours."""
+    _NS     = "http://www.w3.org/2005/Atom"
+    cutoff  = datetime.datetime.now(datetime.timezone.utc).timestamp() - 86400
+
+    try:
+        r = requests.get(
+            f"https://www.reddit.com/user/{username}/submitted/.rss",
+            headers=REDDIT_HEADERS,
+            params={"sort": "new", "limit": limit},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            logger.warning("@%s RSS HTTP %d: %s", username, r.status_code, r.text[:200])
+            return []
+
+        root    = ET.fromstring(r.content)
+        entries = root.findall(f"{{{_NS}}}entry")
+        posts   = []
+        for e in entries:
+            pub = e.findtext(f"{{{_NS}}}published") or ""
+            try:
+                ts = datetime.datetime.fromisoformat(pub.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            if ts < cutoff:
+                continue
+            cat   = e.find(f"{{{_NS}}}category")
+            sub   = (cat.get("term") if cat is not None else None) or ""
+            if sub.startswith("u/"):       # RSS uses u/name; rest of code expects u_name
+                sub = "u_" + sub[2:]
+            link    = e.find(f"{{{_NS}}}link")
+            url     = (link.get("href") if link is not None else "") or ""
+            title   = e.findtext(f"{{{_NS}}}title") or ""
+            rss_id  = e.findtext(f"{{{_NS}}}id") or ""          # e.g. "t3_1tiihmd"
+            url_parts = url.split("/comments/")
+            post_id = url_parts[1].split("/")[0] if len(url_parts) > 1 else rss_id.replace("t3_", "")
+            posts.append({
+                "subreddit":   sub,
+                "title":       title,
+                "url":         url,
+                "post_id":     post_id,                          # e.g. "1tiihmd"
+                "created_utc": ts,
+                "score":       0,
+                "ups":         0,
+            })
+
+        logger.info("@%s RSS: %d posts within 24h", username, len(posts))
+        return posts
+
+    except Exception as e:
+        logger.warning("@%s RSS fetch failed: %s", username, e)
+        return []
 
 
 def db_save_competitor_insight(
@@ -796,12 +891,32 @@ async def run_competitor_analysis(known_subs: set[str]) -> str:
 # ─── Daily plan pipeline ──────────────────────────────────────────────────────
 
 async def run_daily_plan(app) -> None:
-    """Scheduled: every day 11:00 Asia/Bangkok. Checks 3 tracked girls' last 24h posts."""
+    """Scheduled: every day 11:00 Asia/Bangkok. Sends readiness prompt — analysis runs on button press."""
     chat_ids = load_chat_ids()
     if not chat_ids:
         logger.warning("No registered chats — skipping daily plan")
         return
 
+    now      = datetime.datetime.now(BANGKOK_TZ)
+    date_str = now.strftime("%d.%m.%Y")
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Готов к анализу", callback_data=CALLBACK_DAILY_READY),
+    ]])
+
+    for cid in chat_ids:
+        try:
+            await app.bot.send_message(
+                chat_id=cid,
+                text=f"📋 ПЛАН НА СЕГОДНЯ — {date_str}\n\nГотовы к анализу?",
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            logger.error("Failed sending daily prompt to %s: %s", cid, e)
+
+
+async def _run_daily_analysis(bot, chat_id: int) -> None:
+    """Full analysis for one chat_id: fetch girls' posts, enrich scores, categorise, send result."""
     now      = datetime.datetime.now(BANGKOK_TZ)
     date_str = now.strftime("%d.%m.%Y")
     reset_tokens()
@@ -823,7 +938,9 @@ async def run_daily_plan(app) -> None:
                 for p in posts
                 if p.get("subreddit") or p.get("subreddit_name_prefixed")
             )
-            if s and not s.startswith("u_")  # filter out user profile pages
+            if s
+            and not s.startswith("u_")
+            and not any(kw in s.lower() for kw in EXCLUDE_KEYWORDS)
         ))
         for s in used_subs:
             if s not in all_subs_ordered:
@@ -835,23 +952,56 @@ async def run_daily_plan(app) -> None:
     total_posts = sum(len(gd["posts"]) for gd in girls_data)
 
     if not all_subs_ordered:
-        for cid in chat_ids:
-            try:
-                await app.bot.send_message(
-                    chat_id=cid,
-                    text=f"📋 ПЛАН НА СЕГОДНЯ — {date_str}\n\nДевочки не постили последние 24 часа."
-                )
-            except Exception:
-                pass
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"📋 ПЛАН НА СЕГОДНЯ — {date_str}\n\nДевочки не постили последние 24 часа."
+            )
+        except Exception:
+            pass
         return
 
-    # ── Subreddit info (subscribers + online now) ────────────────────────────
+    # ── Enrich post scores via ScrapeCreators top-of-day ────────────────────
+    girl_by_name: dict[str, dict] = {gd["username"].lower(): gd for gd in girls_data}
+    for sub in all_subs_ordered:
+        try:
+            sc_posts = await asyncio.to_thread(fetch_top_posts_24h, sub, 25)
+            for sp in sc_posts:
+                author = (sp.get("author") or "").lower()
+                gd = girl_by_name.get(author)
+                if gd is None:
+                    continue
+                sp_score = sp.get("score") or sp.get("ups") or 0
+                if sp_score == 0:
+                    continue
+                sc_id    = sp.get("id") or sp.get("name", "").replace("t3_", "")
+                sp_title = (sp.get("title") or "").strip().lower()
+                for p in gd["posts"]:
+                    if p.get("subreddit") != sub:
+                        continue
+                    if p.get("score", 0) > 0:
+                        continue
+                    id_match    = sc_id and p.get("post_id") and sc_id == p["post_id"]
+                    title_match = sp_title and (p.get("title") or "").strip().lower() == sp_title
+                    if id_match or title_match:
+                        p["score"] = sp_score
+                        p["ups"]   = sp_score
+                        break
+        except Exception as e:
+            logger.warning("Score enrichment r/%s: %s", sub, e)
+
+    # Recompute top_post with real scores
+    for gd in girls_data:
+        if gd["posts"]:
+            gd["top_post"] = max(gd["posts"], key=lambda p: p.get("score") or p.get("ups") or 0)
+
+    # ── Subreddit info (weekly active users) ─────────────────────────────────
     sub_info: dict[str, dict] = {}
     for sub in all_subs_ordered:
         sub_info[sub] = await asyncio.to_thread(fetch_subreddit_info, sub)
 
     # ── Detect flying posts ──────────────────────────────────────────────────
-    flying_subs: dict[str, int] = {}  # sub -> best upvote score
+    flying_subs: dict[str, int] = {}
     for gd in girls_data:
         for p in gd["posts"]:
             score = p.get("score") or p.get("ups") or 0
@@ -861,77 +1011,41 @@ async def run_daily_plan(app) -> None:
                 if sub not in flying_subs or score > flying_subs[sub]:
                     flying_subs[sub] = score
 
-    # ── Claude: categorize subreddits ────────────────────────────────────────
-    girls_lines = []
-    for gd in girls_data:
-        top = gd["top_post"]
-        top_info = ""
-        if top:
-            ts    = top.get("score") or top.get("ups") or 0
-            tsub  = top.get("subreddit") or "?"
-            ttitl = (top.get("title") or "")[:50]
-            top_info = f" | Лучший: {ts} апв r/{tsub} «{ttitl}»"
-        girls_lines.append(
-            f"@{gd['username']}: {len(gd['posts'])} постов → {', '.join(gd['used_subs']) or 'нет'}{top_info}"
-        )
-
-    sub_info_lines = []
+    # ── Per-subreddit best post score today ──────────────────────────────────
+    sub_best: dict[str, int] = {}
     for sub in all_subs_ordered:
-        info = sub_info.get(sub, {})
-        subs_count = info.get("subscribers", 0)
-        # best post score in this sub today
         best = 0
         for gd in girls_data:
             for p in gd["posts"]:
-                ps = p.get("subreddit") or p.get("subreddit_name_prefixed", "").lstrip("r/")
-                if ps == sub:
+                if (p.get("subreddit") or "") == sub:
                     best = max(best, p.get("score") or p.get("ups") or 0)
-        sub_info_lines.append(
-            f"r/{sub}: {subs_count:,} подписчиков, лучший пост сегодня: {best} апв"
-        )
+        sub_best[sub] = best
+
+    # ── Deterministic categorisation ─────────────────────────────────────────
+    def _sort_key(sub: str) -> float:
+        score  = sub_best.get(sub, 0)
+        active = sub_info.get(sub, {}).get("subscribers", 0)
+        return (100_000 if sub in flying_subs else 0) + score * 3 + active / 5_000
 
     hot_subs: list[str]     = []
     good_subs: list[str]    = []
     neutral_subs: list[str] = []
 
-    flying_set = flying_subs  # dict sub -> score
-
-    try:
-        raw_cat = await asyncio.to_thread(
-            ask_openrouter,
-            "Ты Reddit-стратег для продвижения OnlyFans/Fansly контента. Отвечай строго по формату.",
-            f"Сегодня {date_str}. Девочки постили за последние 24 часа:\n\n"
-            + "\n".join(girls_lines) + "\n\n"
-            "Данные сабреддитов:\n" + "\n".join(sub_info_lines) + "\n\n"
-            f"У девочек залетело (200+ апвоутов или быстрый набор) в: {', '.join(flying_subs.keys()) or 'нет'}\n\n"
-            "Раздели ВСЕ сабреддиты на 3 категории по перспективности для постинга СЕГОДНЯ.\n"
-            "Критерии:\n"
-            "ГОРЯЧИЕ — залетело у девочек (200+ апв) И/ИЛИ большая аудитория\n"
-            "ХОРОШИЕ — средняя аудитория или умеренные результаты у девочек\n"
-            "НЕЙТРАЛЬНЫЕ — мало трафика, слабые результаты\n\n"
-            "Формат СТРОГО (только эти 3 строки, включи ВСЕ сабреддиты):\n"
-            "ГОРЯЧИЕ: sub1,sub2,sub3\n"
-            "ХОРОШИЕ: sub1,sub2\n"
-            "НЕЙТРАЛЬНЫЕ: sub1\n\n"
-            f"Сабреддиты для распределения ({len(all_subs_ordered)} штук): {', '.join(all_subs_ordered)}",
-            400,
-        )
-    except Exception as e:
-        logger.error("Daily plan Claude call failed: %s", e)
-        raw_cat = ""
-
-    for line in raw_cat.splitlines():
-        ls = line.strip()
-        up = ls.upper()
-        if   up.startswith("ГОРЯЧИЕ:"):     hot_subs     = [s.strip().lstrip("r/") for s in ls.split(":",1)[1].split(",") if s.strip()]
-        elif up.startswith("ХОРОШИЕ:"):     good_subs    = [s.strip().lstrip("r/") for s in ls.split(":",1)[1].split(",") if s.strip()]
-        elif up.startswith("НЕЙТРАЛЬНЫЕ:"): neutral_subs = [s.strip().lstrip("r/") for s in ls.split(":",1)[1].split(",") if s.strip()]
-
-    # Uncategorized → neutral (ensures ALL subs are always shown)
-    categorized = set(hot_subs + good_subs + neutral_subs)
     for sub in all_subs_ordered:
-        if sub not in categorized:
+        score  = sub_best.get(sub, 0)
+        active = sub_info.get(sub, {}).get("subscribers", 0)
+        if sub in flying_subs or score >= 70 or (score >= 40 and active >= 100_000):
+            hot_subs.append(sub)
+        elif score >= 25 or (score >= 10 and active >= 80_000):
+            good_subs.append(sub)
+        else:
             neutral_subs.append(sub)
+
+    hot_subs.sort(key=_sort_key, reverse=True)
+    good_subs.sort(key=_sort_key, reverse=True)
+    neutral_subs.sort(key=_sort_key, reverse=True)
+
+    flying_set = flying_subs
 
     # ── Build Telegram message ───────────────────────────────────────────────
     lines: list[str] = [f"📋 ПЛАН НА СЕГОДНЯ — {date_str}\n"]
@@ -941,11 +1055,18 @@ async def run_daily_plan(app) -> None:
         return f"{n/1000:.1f}к".replace(".0к", "к") if n >= 1000 else str(n)
 
     def _sub_line_full(s: str) -> str:
-        info = sub_info.get(s, {})
-        subs = info.get("subscribers", 0)
+        info  = sub_info.get(s, {})
+        subs  = info.get("subscribers", 0)
         score = flying_set.get(s)
-        flew  = f"  📈 залетело ({_fmt_score(score)})" if score is not None else ""
-        return f"r/{s}  ({subs:,} подп.){flew}"
+        flew  = f"  📈 залетело ({_fmt_score(score)} апв)" if score is not None else ""
+        label = _fmt_score(subs) if subs else "?"
+        return f"r/{s}  ({label} акт./нед.){flew}"
+
+    def _sub_line_compact(s: str) -> str:
+        info  = sub_info.get(s, {})
+        subs  = info.get("subscribers", 0)
+        label = _fmt_score(subs) if subs else "?"
+        return f"r/{s} ({label})"
 
     if hot_subs:
         lines.append("🔥 ГОРЯЧИЕ РЕДДИТЫ:")
@@ -959,7 +1080,7 @@ async def run_daily_plan(app) -> None:
 
     if neutral_subs:
         lines.append("⚪ НЕЙТРАЛЬНЫЕ РЕДДИТЫ:")
-        lines.append(", ".join(f"r/{s}" for s in neutral_subs))
+        lines.append("  " + ",  ".join(_sub_line_compact(s) for s in neutral_subs))
         lines.append("")
 
     message_text = "\n".join(lines)
@@ -970,25 +1091,24 @@ async def run_daily_plan(app) -> None:
         InlineKeyboardButton("⚪ Нейтральное", callback_data=CALLBACK_DAILY_NEUTRAL),
     ]])
 
-    for cid in chat_ids:
-        try:
-            await app.bot.send_message(chat_id=cid, text=message_text, reply_markup=keyboard)
-            if len(_daily_cache) > 50:
-                del _daily_cache[next(iter(_daily_cache))]
-            _daily_cache[cid] = {
-                "hot":        hot_subs,
-                "good":       good_subs,
-                "neutral":    neutral_subs,
-                "flying":     dict(flying_subs),
-                "sub_info":   sub_info,
-                "girls_data": [{"username": gd["username"], "used_subs": gd["used_subs"]} for gd in girls_data],
-                "date_str":   date_str,
-            }
-            _save_cache(_daily_cache)
-        except Exception as e:
-            logger.error("Failed sending daily plan to %s: %s", cid, e)
+    try:
+        await bot.send_message(chat_id=chat_id, text=message_text, reply_markup=keyboard)
+        if len(_daily_cache) > 50:
+            del _daily_cache[next(iter(_daily_cache))]
+        _daily_cache[chat_id] = {
+            "hot":        hot_subs,
+            "good":       good_subs,
+            "neutral":    neutral_subs,
+            "flying":     dict(flying_subs),
+            "sub_info":   sub_info,
+            "girls_data": [{"username": gd["username"], "used_subs": gd["used_subs"]} for gd in girls_data],
+            "date_str":   date_str,
+        }
+        _save_cache(_daily_cache)
+    except Exception as e:
+        logger.error("Failed sending daily plan to %s: %s", chat_id, e)
 
-    logger.info("Daily plan sent. %s", token_summary())
+    logger.info("Daily analysis sent to %s. %s", chat_id, token_summary())
 
 
 async def _analyze_subs_for_pdf(subs_raw: list[dict]) -> list[dict]:
@@ -1015,7 +1135,7 @@ async def _analyze_subs_for_pdf(subs_raw: list[dict]) -> list[dict]:
             "Для каждого саба выведи блок:\n"
             "SUBSTART\n"
             "NAME: название_саба\n"
-            "EXCLUDE: да или нет  (да — ТОЛЬКО если для апвоутов ОБЯЗАТЕЛЬНО нужно показывать киску или анус)\n"
+            "EXCLUDE: да или нет  (да — если: 1) для апвоутов ОБЯЗАТЕЛЬНО нужно показывать киску или анус; ИЛИ 2) саб направлен конкретно на рыжих/ginger девушек)\n"
             "RULES_RU: [все правила на русском, каждое с новой строки]\n"
             "VERIFICATION: нужна / не нужна / нужна — подробности\n"
             "NUDITY: бикини / топлесс / полностью голая / зависит от поста\n"
@@ -1262,6 +1382,16 @@ async def callback_daily_category(update: Update, context: ContextTypes.DEFAULT_
             pass
 
 
+# ─── Callback: "Готов к анализу" button ──────────────────────────────────────
+
+async def callback_daily_ready(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query   = update.callback_query
+    chat_id = query.message.chat_id
+    await query.answer()
+    await context.bot.send_message(chat_id=chat_id, text="🔍 Запускаю анализ, подожди минуту...")
+    await _run_daily_analysis(context.bot, chat_id)
+
+
 # ─── Telegram command handlers ────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1282,10 +1412,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_todayplan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Manual trigger: run daily plan right now."""
+    """Manual trigger: run full analysis right now."""
     save_chat_id(update.effective_chat.id)
-    await update.message.reply_text("Запускаю дневной план...")
-    await run_daily_plan(context.application)
+    await update.message.reply_text("🔍 Запускаю анализ, подожди минуту...")
+    await _run_daily_analysis(context.bot, update.effective_chat.id)
 
 
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1335,14 +1465,18 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 def search_subreddits_by_keyword(keyword: str, limit: int = 25) -> list[dict]:
-    r = requests.get(
-        "https://www.reddit.com/subreddits/search.json",
-        headers=REDDIT_HEADERS,
-        params={"q": keyword, "limit": limit},
-        timeout=10,
-    )
-    r.raise_for_status()
-    return [c["data"] for c in r.json().get("data", {}).get("children", [])]
+    try:
+        r = requests.get(
+            "https://www.reddit.com/subreddits/search.json",
+            headers=REDDIT_HEADERS,
+            params={"q": keyword, "limit": limit},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return [c["data"] for c in r.json().get("data", {}).get("children", [])]
+    except Exception as e:
+        logger.warning("search_subreddits_by_keyword %r failed: %s", keyword, e)
+        return []
 
 
 def filter_by_subscribers(subs: list[dict], min_subs: int = 10_000) -> list[dict]:
@@ -1519,6 +1653,10 @@ def main() -> None:
     app.add_handler(CommandHandler("todayplan",   cmd_todayplan))
     app.add_handler(CommandHandler("competitors", cmd_competitors))
     app.add_handler(CommandHandler("ask",         cmd_ask))
+    app.add_handler(CallbackQueryHandler(
+        callback_daily_ready,
+        pattern=f"^{CALLBACK_DAILY_READY}$"
+    ))
     app.add_handler(CallbackQueryHandler(
         callback_daily_category,
         pattern=f"^({CALLBACK_DAILY_HOT}|{CALLBACK_DAILY_GOOD}|{CALLBACK_DAILY_NEUTRAL})$"
